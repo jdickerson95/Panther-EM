@@ -52,7 +52,7 @@ def disk_mean(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
     )
 
     # Windowed re-centering to per-pixel
-    r0, c0 = (k_h - 1) // 2, (k_w - 1) // 2
+    r0, c0 = k_h // 2, k_w // 2  # the support's center, the FFT center
     window = (slice(r0, r0 + h), slice(c0, c0 + w))
 
     mean: torch.Tensor = numerator[window] / denominator[window].clamp_min(1e-12)

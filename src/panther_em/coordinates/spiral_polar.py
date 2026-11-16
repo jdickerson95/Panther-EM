@@ -636,11 +636,7 @@ class SpiralPolarTransform(CoordinateTransform):
         height, width = image_shape
 
         if center is None:
-            # The center of a Fourier-slice projection (and of an FFT-centered image):
-            # index n // 2, not (n - 1) / 2. For an even box the old (n / 2 - 0.5)
-            # rotated every template in-plane about a point half a pixel off its
-            # center, moving the correlation peak by (I - R(-psi)) (1/2, 1/2) px.
-            # Odd boxes are unchanged (n // 2 == (n - 1) / 2).
+            # The center of a Fourier-slice projection is (h // 2, w // 2)
             center = (float(height // 2), float(width // 2))
 
         if radius is None:
