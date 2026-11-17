@@ -11,7 +11,9 @@ stopped. A micrograph's ``mask`` restricts the search to the positions whose box
 center it covers (one whose mask leaves none is not searched). Results are written
 on a background thread while the next micrograph is searched (``pending_writes``),
 and the next micrographs can be read on another (``prefetch``).
-``search_summary.json`` collects each micrograph's label counts.
+``search_summary.json`` collects each micrograph's label counts. With ``fdr`` set (the
+default) each micrograph's final picks are cut at its own false-discovery-rate
+threshold after the search (:mod:`~panther_em.managers.fdr`).
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from panther_em.managers._common import (
     read_micrograph,
     save_output,
 )
+from panther_em.managers.fdr import apply_fdr
 from panther_em.search import (
     Calibration,
     Decision,
@@ -188,6 +191,26 @@ class SearchConfig(ProgramConfig):
         changed (z-scores, null calibrations and thresholds from those runs do not
         carry over). See :mod:`panther_em.search.normalization` and
         ``docs/after_ctf_normalization.md``.
+    fdr : float or None
+        False discovery rate of the final picks, default 0.05: per micrograph, after
+        the search, only the peaks above the Benjamini-Hochberg threshold stay
+        ACCEPTED, with the independent-trial formula as the null (conservative: the
+        realised FDR is lower). Applies when the final stage's threshold is
+        ``"auto"``. ``None``: the fixed ``"auto"`` threshold, one expected false
+        detection per micrograph (the behaviour before this option). See
+        :mod:`panther_em.managers.fdr` and ``docs/fdr_detection.md``.
+    fdr_reach : float
+        With ``fdr`` set, the final stage's ``"auto"`` threshold -- the lowest z the
+        FDR cut can reach -- sits this many z below the 1-FP threshold. Default 0.5.
+    fdr_gate_reach : float
+        With ``fdr`` set, the earlier stages' ``"auto"`` thresholds (the stage-1
+        gate) are lowered by this many z. The gate's own margin keeps pixels about
+        0.3 z further down, so 0.25 covers the 0.5 floor; it sets the extra cost
+        (1.6 to 1.9x the search time on a 4k micrograph: stage 2 sees ~3x the
+        pixels). Default 0.25.
+    fdr_peak_radius : float
+        Minimum distance between the peaks the FDR rule counts, pixels. Default 10
+        (the particle export's ``peak_radius``).
     """
 
     program: ClassVar[str] = "search"
@@ -211,6 +234,10 @@ class SearchConfig(ProgramConfig):
     prefetch: int = Field(default=0, ge=0)
     device: str = "cpu"
     normalization: Literal["after_ctf", "before_ctf"] = "after_ctf"
+    fdr: float | None = Field(default=0.05, gt=0.0, lt=1.0)
+    fdr_reach: float = Field(default=0.5, ge=0.0)
+    fdr_gate_reach: float = Field(default=0.25, ge=0.0)
+    fdr_peak_radius: float = Field(default=10.0, gt=0.0)
 
     @model_validator(mode="after")
     def _links(self) -> SearchConfig:
@@ -303,6 +330,7 @@ class _Run:
         self.searchers: dict[tuple[int, int], Searcher] = {}
         self.normalization: AfterCtfNormalization | None = None
         self.normalization_reports: dict[str, dict] = {}
+        self.fdr_reports: dict[str, dict] = {}
         if config.normalization == "after_ctf":
             self._normalize_after_ctf()
 
@@ -352,18 +380,54 @@ class _Run:
         self.template.scale_rows(a)
         self.tables = {tag: scale_table(t, a) for tag, t in self.tables.items()}
 
-    def threshold(self, spec: StageSpec, n_pixels: int) -> float:
-        """The stage's threshold for a micrograph of ``n_pixels`` searched positions."""
-        if spec.decision.threshold != "auto":
-            return float(spec.decision.threshold)
+    def n_hypotheses(self, spec: StageSpec) -> int:
+        """Hypotheses per position: planes x filters x orientations x ``spec.n_psi``."""
         space = self.template.space
-        n_hypotheses = (
+        return (
             len(self.config.defocus_offsets)
             * space.n_filters
             * space.n_orientations
             * spec.n_psi
         )
-        return zscore_threshold(n_pixels, n_hypotheses)
+
+    @property
+    def fdr_active(self) -> bool:
+        """Whether the FDR rule sets the final picks (``fdr`` set, final stage auto)."""
+        final = self.config.stages[-1].decision.threshold
+        return self.config.fdr is not None and final == "auto"
+
+    def threshold(self, spec: StageSpec, n_pixels: int) -> float:
+        """The stage's threshold for a micrograph of ``n_pixels`` searched positions.
+
+        Its own, or the 1-FP formula's for ``"auto"``, lowered by ``fdr_reach``
+        (final stage) or ``fdr_gate_reach`` (earlier stages) when the FDR rule is on.
+        """
+        if spec.decision.threshold != "auto":
+            return float(spec.decision.threshold)
+        t = zscore_threshold(n_pixels, self.n_hypotheses(spec))
+        if not self.fdr_active:
+            return t
+        final = spec is self.config.stages[-1]
+        return t - (self.config.fdr_reach if final else self.config.fdr_gate_reach)
+
+    def apply_fdr(
+        self, result: SearchResult, n_pixels: int
+    ) -> tuple[SearchResult, dict]:
+        """Keep ACCEPTED only the peaks above the micrograph's BH threshold.
+
+        ``n_pixels`` is the micrograph's searched positions (under its mask).
+        """
+        final = self.config.stages[-1]
+        assert self.config.fdr is not None
+        return apply_fdr(
+            result,
+            q=self.config.fdr,
+            n_positions=n_pixels,
+            n_hypotheses=self.n_hypotheses(final),
+            floor=self.threshold(final, n_pixels),
+            peak_radius=self.config.fdr_peak_radius,
+            absorb_radius=final.decision.absorb_radius,
+        )
 
     def n_positions(self, shape: tuple[int, int]) -> int:
         """Search positions of an unmasked micrograph of ``shape``."""
@@ -585,6 +649,8 @@ def run(config: SearchConfig) -> dict[str, Path]:
         done[name] = path
         if state is not None and name in state.normalization_reports:
             record["normalization"] = state.normalization_reports[name]
+        if state is not None and name in state.fdr_reports:
+            record["fdr"] = state.fdr_reports[name]
         summary[name] = record
         summary_path.write_text(json.dumps(summary, indent=1))
 
@@ -627,6 +693,10 @@ def run(config: SearchConfig) -> dict[str, Path]:
                 result = state.searcher(shape).run(
                     micrograph, thresholds=state.thresholds(micrograph)
                 )
+                if state.fdr_active:
+                    result, state.fdr_reports[name] = state.apply_fdr(
+                        result, state.n_searchable(micrograph)
+                    )
                 t3 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device
                 result = result.to("cpu")

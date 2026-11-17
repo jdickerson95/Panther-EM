@@ -52,6 +52,7 @@ from panther_em.managers._common import (
     read_volume,
     save_output,
 )
+from panther_em.managers.fdr import expected_false_peaks
 from panther_em.search import (
     ExecutionConfig,
     Micrograph,
@@ -300,13 +301,22 @@ def test_masked_search(pipeline, tmp_path):
     assert m0["mask"] == str(tmp_path / "m0_mask.mrc")
     assert m0["n_searchable"] == n_searchable < grid.numel()
     assert m0["final"]["MASKED"] == grid.numel() - n_searchable
-    assert m0["thresholds"] == pytest.approx(
-        [zscore_threshold(n_searchable, n_hypotheses)] * 2
-    )
     assert m2["mask"] is None and m2["n_searchable"] == grid.numel()
-    assert m2["thresholds"] == pytest.approx(
-        [zscore_threshold(grid.numel(), n_hypotheses)] * 2
-    )
+    # the formula's thresholds on the searchable positions, lowered by the reach of
+    # the default FDR rule (gate, then final stage); its null counts the same positions
+    reach = [config.fdr_gate_reach, config.fdr_reach]
+    for record, n_pixels in ((m0, n_searchable), (m2, grid.numel())):
+        assert record["thresholds"] == pytest.approx(
+            [zscore_threshold(n_pixels, n_hypotheses) - r for r in reach]
+        )
+        cut = record["fdr"]["threshold"]
+        if cut is None:  # no peak qualifies: m2 has no particle
+            continue
+        expected = expected_false_peaks(torch.tensor([cut]), n_pixels, n_hypotheses)
+        assert record["fdr"]["expected_false_picks_formula"] == pytest.approx(
+            float(expected[0])
+        )
+    assert m0["fdr"]["threshold"] is not None  # the particle's micrograph
     assert m0["thresholds"][0] < m2["thresholds"][0]
     assert m1["n_searchable"] == 0 and "skipped" in m1
 
@@ -487,7 +497,9 @@ def test_export_stack(pipeline):
     accepted = torch.nonzero(result.label[0] == int(PixelLabel.ACCEPTED)).float()
     picks = torch.tensor(df[["pos_y", "pos_x"]].to_numpy().copy(), dtype=torch.float32)
     assert float(torch.cdist(accepted, picks).min(1).values.max()) <= 10.0
-    assert len(df) < len(accepted)
+    # <=: with the FDR default (SearchConfig.fdr) a lone particle's accepted region
+    # can shrink to its peak pixel
+    assert len(df) <= len(accepted)
 
     # Leopard-EM reads the statistic maps through the path columns
     maps = stack.get_local_stat_maps(use_stored=False)

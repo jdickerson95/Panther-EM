@@ -9,6 +9,10 @@ restores Panther's original behaviour.
 > refine-and-rescore cuts and hard-coded z thresholds made with earlier versions do not
 > carry over. Re-run the nulls, or set `normalization: before_ctf` to reproduce old results
 > exactly. Each result file records the setting (the search config is stored with it).
+>
+> **5 % FDR is also the default detection rule** (`fdr: 0.05`; see
+> `docs/fdr_detection.md`). To reproduce results from before both changes set
+> `normalization: before_ctf` and `fdr: null`.
 
 **In one sentence:** every `(defocus plane, template)` hypothesis is rescaled so that its
 correlation has the same noise variance under its CTF, as Leopard-EM and cisTEM do when
@@ -120,7 +124,9 @@ searched with `after_ctf`. Without nulls, the automatic (formula) threshold stil
 is now conservative: on the synthetic micrographs of section 5 (B 0) at that threshold, recall is
 37.2 % vs 35.3 % before, with 0.42 instead of 1.00 false picks per micrograph (real
 xenon_131: 399 picks vs 403). The full recall gain needs the null-calibrated threshold, which
-sits 0.13 to 0.28 z lower.
+sits 0.13 to 0.28 z lower. The default FDR rule (`docs/fdr_detection.md`) also uses the
+formula with no nulls; it cuts lower on micrographs with many particles (43.6 % recall on
+the same synthetic micrographs at 2.0 % realised FDR).
 
 ## 4. Cost
 
@@ -221,3 +227,4 @@ Panther).
 | `src/panther_em/managers/search.py` | `SearchConfig.normalization`; `_Run` applies `a` at start-up and `b` per micrograph; summary record |
 | `tests/test_normalization.py` | new: exact equalization of separable `e`; residual = interaction; table scaling vs threshold test; `q_kept == e`; per-micrograph apply; `scale_rows`; end-to-end synthetic search (same particle label, pose and plane; z within 10 %) |
 | `docs/after_ctf_normalization.md` | this file |
+| `docs/fdr_detection.md`, `src/panther_em/managers/fdr.py`, `tests/test_fdr.py` | the FDR default (separate doc) |
