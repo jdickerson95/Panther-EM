@@ -39,6 +39,7 @@ from panther_em.managers import (
     CalibrateConfig,
     DecomposeConfig,
     ExportConfig,
+    NullConfig,
     SearchConfig,
     WhiteningConfig,
     calibrate,
@@ -69,6 +70,7 @@ CONFIGS = {
     "calibrate": CalibrateConfig,
     "search": SearchConfig,
     "export": ExportConfig,
+    "null": NullConfig,
 }
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
