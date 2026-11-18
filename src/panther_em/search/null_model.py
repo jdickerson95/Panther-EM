@@ -406,7 +406,7 @@ def predict_null(
     reference: torch.Tensor | None = None,
     mask_radius: float = 10.0,
     n_mean_samples: int = 3000,
-    n_kappa_pairs: int = 64,
+    n_kappa_pairs: int = 256,
     n_lattice_samples: int = 128,
     batch_size: int = 4,
     thresholds: np.ndarray | None = None,
@@ -447,7 +447,10 @@ def predict_null(
         The peak finder's suppression radius, pixels. Default 10.
     n_mean_samples, n_kappa_pairs, n_lattice_samples : int
         Rotations for the mean template, pairs of rotation batches for ``kappa``,
-        rotations for the lattice correlations (each with every plane).
+        rotations for the lattice correlations (each with every plane). Defaults 3000,
+        256 and 128. The lattice sample also sets the hypotheses' variance spread, which
+        Panther has (5-7 % before the CTF, ~1.5 % after): with 32 rotations the cut
+        moves by up to 0.05 z between seeds before the CTF; 128 matches 512 after it.
     batch_size : int
         Rotations per batch for ``kappa`` and the lattice. Default 4.
     thresholds : numpy.ndarray, optional

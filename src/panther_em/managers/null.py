@@ -93,7 +93,7 @@ class AnalyticSpec(Model):
     """Sampling of the analytic prediction (:func:`~.null_model.predict_null`)."""
 
     n_mean_samples: int = Field(default=3000, ge=2)
-    n_kappa_pairs: int = Field(default=64, ge=2)
+    n_kappa_pairs: int = Field(default=256, ge=2)
     n_lattice_samples: int = Field(default=128, ge=1)
     batch_size: int = Field(default=4, ge=1)
     seed: int = 0

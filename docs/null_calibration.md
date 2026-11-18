@@ -132,12 +132,12 @@ Micrograph `i` of the search config uses seeds `seed + i * seed_stride` (default
 
 * **Measured:** one full search per copy, plus a few seconds of peak finding: 5 to 6 min
   per 4k copy of the 13-plane production config (dense stage 1) on an RTX 6000 Ada.
-* **Analytic:** 21-23 s per 13-plane 4k configuration on one RTX 6000 Ada (3,000
-  rotations for the mean template, 64 x 2 x 4 for `kappa`, 128 x 13 for the lattice), plus
-  the program's set-up (template and tables, ~30 s). Memory: the padded volume DFT (4.3 GB
-  for a 512^3 template) and the 4k image. On 8 CPU threads the same prediction takes 21 min
-  (26 GB of memory) and gives the same cut to 1e-7. The predictor's own sampling spread is
-  +-0.01 z (seeds 0-2).
+* **Analytic:** 51-55 s per 13-plane 4k configuration on one RTX 6000 Ada, set-up
+  (template and tables) included, with the default sampling: 3,000 rotations for the mean
+  template, 256 x 2 x 4 for `kappa`, 128 x 13 for the lattice. Memory: the padded volume
+  DFT (4.3 GB for a 512^3 template) and the 4k image. On 8 CPU threads the earlier sampling
+  (64 `kappa` batch pairs) took 21 min (26 GB of memory) and gave the same cut to 1e-7.
+  The predictor's own sampling spread is +-0.01 z (seeds 0-2).
 
 ## 5. Validation on xenon_131
 
@@ -150,22 +150,29 @@ phase-randomised nulls per configuration. Scripts and outputs live outside this 
 
 | Search (13 planes) | Predicted, sampling seed 0 (seeds 1, 2) | Measured: counted / gate-corrected / smoothed | Formula |
 |---|---|---|---|
-| B 0, after-CTF | **7.781** (7.783, 7.784) | 7.730 / 7.725 / 7.723 | 7.859 |
-| B 60, after-CTF | **7.675** (7.680, 7.682) | 7.651 / 7.665 / 7.635 | 7.859 |
-| B 120, after-CTF | **7.586** (7.592, 7.596) | 7.569 / 7.580 / 7.522 | 7.859 |
-| B 0, before-CTF | **7.895** (7.898, 7.888) | 7.853 / 7.853 / 7.844 | 7.859 |
-| B 60, before-CTF | **7.843** (7.848, 7.835) | 7.841 / 7.841 / 7.825 | 7.859 |
-| B 120, before-CTF | **7.793** (7.800, 7.785) | 7.792 / 7.792 / 7.872 | 7.859 |
+| B 0, after-CTF | **7.775** (7.779, 7.777) | 7.730 / 7.725 / 7.723 | 7.859 |
+| B 60, after-CTF | **7.666** (7.673, 7.670) | 7.651 / 7.665 / 7.635 | 7.859 |
+| B 120, after-CTF | **7.574** (7.584, 7.580) | 7.569 / 7.580 / 7.522 | 7.859 |
+| B 0, before-CTF | **7.881** (7.879, 7.880) | 7.853 / 7.853 / 7.844 | 7.859 |
+| B 60, before-CTF | **7.823** (7.821, 7.824) | 7.841 / 7.841 / 7.825 | 7.859 |
+| B 120, before-CTF | **7.769** (7.769, 7.772) | 7.792 / 7.792 / 7.872 | 7.859 |
 
 "Gate-corrected" adds the peaks the production gate dropped (from ungated searches of 1-3
 nulls); "formula" is the independent-trials cut on the same valid area.
 
-* **Agreement.** Every prediction lies 0.00 to 0.06 z above the measured (gate-corrected)
-  cut, so it errs on the safe side: within 0.01 z at B 60 / 120 and 0.04 / 0.06 z at B 0
-  (1.4 / 1.6 predicted false positives per micrograph at the measured cut). The CPU
+* **Agreement.** Every prediction lies within -0.02 to +0.05 z of the measured
+  (gate-corrected) cut: within 0.02 z at B 60 / 120, and 0.03 / 0.05 z high (the safe side)
+  at B 0. The CPU
   prototype, built on Leopard-EM's projections, was also 0.04 z high at B 0, so that offset
   belongs to the model, not to this implementation. The predictor's own sampling spread is
   +-0.01 z.
+* **Sampling.** The defaults were chosen by scanning B 120 (seeds 0-2, 256 `kappa` batch
+  pairs). The lattice sample also gives the hypotheses' variance spread, which Panther has:
+  with 32 lattice rotations the before-CTF cut moved by up to 0.05 z between seeds (7.731 to
+  7.777), with 128 by 0.004 (7.769 to 7.772), and 512 gave 7.776 to 7.782; after CTF, 128
+  and 512 agree (7.574 to 7.584). Quadrupling the `kappa` pairs from 64 lowered the cuts
+  by 0.006 to 0.024 z: `kappa` is an average of heavy-tailed squared correlations, which a
+  small sample tends to underestimate.
 * **Against the formula.** After CTF the formula is 0.13 to 0.28 z too high; the prediction
   recovers 60 % of that gap at B 0 and 95 % or more at B 60 / 120. Before CTF formula and null
   nearly coincide (section 1), and the prediction says so.
