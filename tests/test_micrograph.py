@@ -52,7 +52,7 @@ def ctf_planes(shape, n=3):
 
 def support_disk(box=BOX, radius=7):
     yy, xx = torch.meshgrid(torch.arange(box), torch.arange(box), indexing="ij")
-    c = (box - 1) / 2
+    c = box // 2  # the FFT center, as the transforms' default
     return (yy - c) ** 2 + (xx - c) ** 2 <= radius**2
 
 
@@ -104,7 +104,7 @@ def windowed_disk_mean(values, support):
     """Reference disk mean by explicit windows (zero outside the image)."""
     h, w = values.shape
     k_h, k_w = support.shape
-    r0, c0 = (k_h - 1) // 2, (k_w - 1) // 2
+    r0, c0 = k_h // 2, k_w // 2
     pad = (k_w - 1 - c0, c0, k_h - 1 - r0, r0)
     kernel = support.flip(0, 1).flatten().to(values.dtype)
 

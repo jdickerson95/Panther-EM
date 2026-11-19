@@ -304,7 +304,7 @@ class StandardPolarTransform(CoordinateTransform):
         num_radius : int | None, optional
             Number of radial samples. Defaults to ``ceil(radius)``.
         center : tuple[float, float] | None, optional
-            ``(row, col)`` center. Defaults to image center.
+            ``(row, col)`` center. Defaults to the FFT center ``(h // 2, w // 2)``.
         radius : float | None, optional
             Maximum radius in pixels. Defaults to ``height / 2``.
 
@@ -315,7 +315,8 @@ class StandardPolarTransform(CoordinateTransform):
         height, width = image_shape
 
         if center is None:
-            center = (height / 2 - 0.5, width / 2 - 0.5)
+            # The center of a Fourier-slice projection is (h // 2, w // 2)
+            center = (float(height // 2), float(width // 2))
 
         if radius is None:
             radius = height / 2  # Assuming square images, radius is half the height
