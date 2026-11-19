@@ -4,15 +4,17 @@ The search's default (``SearchConfig.fdr = 0.05``): instead of one fixed z thres
 that gives one expected false detection per micrograph, the final picks are the peaks
 above the Benjamini-Hochberg threshold at false discovery rate ``q``.
 
-Null model. By default the expected number of false peaks above ``t`` is the
-independent-trial count of the search, :math:`\lambda(t) = N_\mathrm{pos}
-N_\mathrm{hyp} Q(t)` (the same formula that sets the 1-FP threshold,
-:func:`~panther_em.search.zscore_threshold`). The search's trials are correlated, so the
-formula over-counts false peaks: on xenon_131 with after-CTF normalization the measured
-null is 0.37 (B 0) to 0.14 (B 120) of it. That threshold is conservative -- the realised
-FDR is below ``q`` -- and needs no null micrographs. A calibrated null (``fdr_null``:
-the summary of ``panther-em null``, its analytic prediction or its phase-randomised
-copies, per micrograph; :func:`calibrated_null_rate`) gives the cut the FDR asks for.
+Null model. The expected number of false peaks above ``t`` on the micrograph,
+:math:`\lambda(t)`. By default (``fdr_null: analytic``) it is the micrograph's analytic
+null, computed by the search from its own template, filters and grid and the
+micrograph's power spectrum (:func:`panther_em.managers.null.predict_search_null`).
+``fdr_null: formula`` uses the independent-trial count, :math:`\lambda(t) =
+N_\mathrm{pos} N_\mathrm{hyp} Q(t)` (the formula behind the 1-FP threshold,
+:func:`~panther_em.search.zscore_threshold`). The search's trials are correlated, so
+the formula over-counts false peaks (on xenon_131 after CTF the null is 0.37 of it at
+B 0 and 0.14 at B 120), and the realised FDR falls below ``q``. A ``panther-em null``
+summary (its analytic prediction or its phase-randomised copies) can be given instead
+(:func:`calibrated_null_rate`).
 
 Rule (step-up, :math:`\pi_0 = 1`). With the peak z-scores sorted in decreasing order,
 :math:`z_{(1)} \ge z_{(2)} \ge \dots`, the threshold is :math:`z_{(k)}` for the largest
@@ -24,14 +26,26 @@ ACCEPTED, found as the particle export finds them (``find_peaks_from_zscore``), 
 count ``k`` is the number of particles the export would write.
 
 Reach. The threshold is only known after the search, but the stages decide per pixel
-during it, so with ``fdr`` set the final stage's ``"auto"`` threshold is lowered by
-``fdr_reach`` (0.5) z below the 1-FP threshold -- the floor of the FDR cut -- and the
-earlier stages' (the stage-1 gate) by ``fdr_gate_reach`` (0.25): the gate keeps pixels
-about 0.3 z below its own threshold, so the final stage still evaluates exactly the
-pixels an FDR cut down to the floor could pick, at 1.6 to 1.9 times the search time
-instead of the ~6x a gate lowered by the full 0.5 would cost. A BH threshold below
-the floor is clamped to it (``capped`` in the report): with the formula null that
-takes about :math:`e^{T \cdot 0.5} / q \approx 1000` peaks per micrograph (T = 7.9).
+during it. With ``fdr`` set, the final stage's ``"auto"`` threshold is therefore
+lowered ``fdr_reach`` (0.5) z below the 1-FP threshold, which makes it the floor of the
+FDR cut. The earlier stages' thresholds (the stage-1 gate) are lowered by
+``fdr_gate_reach`` (0.25), because the gate keeps pixels about 0.3 z below its own
+threshold. The final stage thus still evaluates exactly the pixels an FDR cut down to
+the floor could pick, at 1.6 to 1.9 times the search time, instead of the ~6x a gate
+lowered by the full 0.5 would cost.
+
+The 1-FP threshold the reach is measured from is the null's own (``fdr_anchor:
+null``, the default). The null is computed before the search (:class:`FdrNull`), and
+every ``"auto"`` threshold moves by its 1-FP cut minus the formula's. A blurred
+template gives a smoother field, whose null, and with it the FDR cut, falls well below
+the formula: on Track S after CTF the null's 1-FP cut is 7.78, 7.67 and 7.58 at B 0,
+60 and 120, against the formula's 7.86. With the reach measured from the formula, the
+floor stays at 7.36 at every B. At B 120 it sits 0.03 to 0.12 z below the cuts on the
+dense micrographs, and on one micrograph it stopped the cut.
+
+A BH threshold below the floor is clamped to it (``capped``). Since the search keeps
+no peaks below the floor, a cut the floor stops usually shows instead as every peak
+picked. ``floor_limited`` in the report flags either case.
 """
 
 from __future__ import annotations
@@ -79,6 +93,48 @@ def bh_threshold(
     z = peak_z.double().cpu().numpy().reshape(-1)
     threshold: float | None = bh_cutoff(z, rate, q).bh_threshold
     return threshold
+
+
+@dataclasses.dataclass(frozen=True)
+class FdrNull:
+    """A micrograph's FDR null, prepared before its search.
+
+    Attributes
+    ----------
+    rate : NullRate or None
+        Expected false peaks >= z on the micrograph; ``None``: the formula's.
+    record : dict
+        Where the null came from and where it anchors the thresholds (kept in the
+        report).
+    shift : float
+        How far every ``"auto"`` stage threshold moves: the null's 1-FP cut minus
+        the formula's (``fdr_anchor: null``), else 0.
+    """
+
+    rate: NullRate | None
+    record: dict[str, Any]
+    shift: float = 0.0
+
+
+def null_cut_1fp(
+    rate: NullRate, lo: float = 2.0, hi: float = 12.0, step: float = 1e-3
+) -> float | None:
+    """The z at which ``rate`` falls to one false peak per micrograph.
+
+    Log-linear between the two grid points around the crossing; ``None`` when the
+    rate does not fall below one within ``[lo, hi]`` or is below one from ``lo``.
+    """
+    z = np.arange(lo, hi + step / 2, step)
+    r = np.asarray(rate(z), float)
+    below = np.flatnonzero(r < 1.0)
+    if below.size == 0 or below[0] == 0:
+        return None
+    i = int(below[0])
+    r0, r1 = r[i - 1], r[i]
+    if not (np.isfinite(r0) and r1 > 0.0):
+        return float(z[i])
+    frac = np.log(r0) / (np.log(r0) - np.log(r1))
+    return float(z[i - 1] + frac * (z[i] - z[i - 1]))
 
 
 def calibrated_null_rate(
@@ -177,8 +233,10 @@ def apply_fdr(
     tuple
         The relabelled result and a report: the BH threshold (``None`` if no
         peak qualifies), the applied threshold, whether it was capped at the floor,
-        the peaks considered and picked, the null used and the expected false picks
-        under it (and under the formula).
+        whether the floor limited it (``floor_limited``: capped, or every peak
+        above the floor picked, so a lower floor might have picked more), the peaks
+        considered and picked, the null used and the expected false picks under it
+        (and under the formula).
     """
     from leopard_em.analysis.zscore_metric import find_peaks_from_zscore
 
@@ -216,6 +274,10 @@ def apply_fdr(
     expected = formula
     if t_bh is not None and rate is not None:
         expected = float(np.asarray(rate(np.array([threshold])), float)[0])
+    # The peaks stop at the floor, so a BH cut can only fall below it by picking all
+    # of them: that is where a lower floor might have picked more ("capped" alone
+    # cannot see it).
+    all_picked = t_bh is not None and n_picks == int(peak_z.numel())
     report = {
         "q": q,
         **(null_record or {"null": "formula" if rate is None else "given"}),
@@ -223,6 +285,7 @@ def apply_fdr(
         "threshold": None if t_bh is None else threshold,
         "floor": floor,
         "capped": capped,
+        "floor_limited": bool(capped or all_picked),
         "n_peaks_considered": int(peak_z.numel()),
         "n_picks": n_picks,
         "expected_false_picks": expected,

@@ -205,6 +205,7 @@ def test_search_resumes(pipeline, tmp_path, monkeypatch):
     steps = (
         "read_s",
         "prepare_s",
+        "fdr_null_s",
         "search_s",
         "handoff_s",
         "save_result_s",
@@ -305,11 +306,16 @@ def test_masked_search(pipeline, tmp_path):
     assert m0["final"]["MASKED"] == grid.numel() - n_searchable
     assert m2["mask"] is None and m2["n_searchable"] == grid.numel()
     # the formula's thresholds on the searchable positions, lowered by the reach of
-    # the default FDR rule (gate, then final stage); its null counts the same positions
+    # the default FDR rule (gate, then final stage) and moved to the null's own 1-FP
+    # cut (fdr_anchor: null); its null counts the same positions
     reach = [config.fdr_gate_reach, config.fdr_reach]
     for record, n_pixels in ((m0, n_searchable), (m2, grid.numel())):
+        shift = record["fdr"].get("anchor_shift", 0.0)
+        assert record["fdr"]["formula_cut_1fp"] == pytest.approx(
+            zscore_threshold(n_pixels, n_hypotheses)
+        )
         assert record["thresholds"] == pytest.approx(
-            [zscore_threshold(n_pixels, n_hypotheses) - r for r in reach]
+            [zscore_threshold(n_pixels, n_hypotheses) - r + shift for r in reach]
         )
         cut = record["fdr"]["threshold"]
         if cut is None:  # no peak qualifies: m2 has no particle
@@ -319,7 +325,9 @@ def test_masked_search(pipeline, tmp_path):
             float(expected[0])
         )
     assert m0["fdr"]["threshold"] is not None  # the particle's micrograph
-    assert m0["thresholds"][0] < m2["thresholds"][0]
+    # fewer searchable positions, a lower formula cut (the anchored thresholds also
+    # follow each micrograph's own null, so they need not be ordered)
+    assert m0["fdr"]["formula_cut_1fp"] < m2["fdr"]["formula_cut_1fp"]
     assert m1["n_searchable"] == 0 and "skipped" in m1
 
     # Leopard-EM: masked positions are padded, never picked, and not in the scale

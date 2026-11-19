@@ -43,7 +43,12 @@ from panther_em.managers._common import (
     read_volume,
     save_output,
 )
-from panther_em.managers.fdr import apply_fdr, calibrated_null_rate
+from panther_em.managers.fdr import (
+    FdrNull,
+    apply_fdr,
+    calibrated_null_rate,
+    null_cut_1fp,
+)
 from panther_em.search import (
     Calibration,
     Decision,
@@ -198,21 +203,32 @@ class SearchConfig(ProgramConfig):
         ``docs/after_ctf_normalization.md``.
     fdr : float or None
         False discovery rate of the final picks, default 0.05: per micrograph, after
-        the search, only the peaks above the Benjamini-Hochberg threshold stay
-        ACCEPTED, with the independent-trial formula as the null (conservative: the
-        realised FDR is lower). Applies when the final stage's threshold is
-        ``"auto"``. ``None``: the fixed ``"auto"`` threshold, one expected false
-        detection per micrograph (the behaviour before this option). See
-        :mod:`panther_em.managers.fdr` and ``docs/fdr_detection.md``.
+        the search, only the peaks above the Benjamini-Hochberg threshold under the
+        micrograph's null (``fdr_null``) stay ACCEPTED. Applies when the final stage's
+        threshold is ``"auto"``. ``None``: the fixed ``"auto"`` threshold, one
+        expected false detection per micrograph (the behaviour before this option).
+        See :mod:`panther_em.managers.fdr` and ``docs/fdr_detection.md``.
     fdr_reach : float
         With ``fdr`` set, the final stage's ``"auto"`` threshold -- the lowest z the
-        FDR cut can reach -- sits this many z below the 1-FP threshold. Default 0.5.
+        FDR cut can reach (the floor) -- sits this many z below the 1-FP threshold
+        (``fdr_anchor``'s). Default 0.5.
     fdr_gate_reach : float
         With ``fdr`` set, the earlier stages' ``"auto"`` thresholds (the stage-1
-        gate) are lowered by this many z. The gate's own margin keeps pixels about
-        0.3 z further down, so 0.25 covers the 0.5 floor; it sets the extra cost
-        (1.6 to 1.9x the search time on a 4k micrograph: stage 2 sees ~3x the
+        gate) sit this many z below their 1-FP thresholds, moved with the final
+        stage's (``fdr_anchor``). The gate's own margin keeps pixels about 0.3 z
+        further down, so 0.25 covers the 0.5 floor; it sets the extra cost (1.6 to
+        1.9x the search time on a 4k micrograph at B 0: stage 2 sees ~3x the
         pixels). Default 0.25.
+    fdr_anchor : {"null", "formula"}
+        Which 1-FP threshold ``fdr_reach`` and ``fdr_gate_reach`` are measured
+        from. ``"null"`` (default): the micrograph's FDR null's own 1-FP cut, so
+        the floor sits ``fdr_reach`` below the cut the null itself puts at one
+        false peak. Every ``"auto"`` threshold moves by that cut minus the
+        formula's: down for a smooth field (a blurred template), where the null is
+        far below the formula and the FDR cut falls with it. ``"formula"``: the
+        independent-trial 1-FP threshold, which ignores the template (the behaviour
+        before this option). With ``fdr_null: formula``, or a null without a 1-FP
+        crossing, both are the formula's.
     fdr_peak_radius : float
         Minimum distance between the peaks the FDR rule counts, pixels. Default 10
         (the particle export's ``peak_radius``).
@@ -260,6 +276,7 @@ class SearchConfig(ProgramConfig):
     fdr: float | None = Field(default=0.05, gt=0.0, lt=1.0)
     fdr_reach: float = Field(default=0.5, ge=0.0)
     fdr_gate_reach: float = Field(default=0.25, ge=0.0)
+    fdr_anchor: Literal["null", "formula"] = "null"
     fdr_peak_radius: float = Field(default=10.0, gt=0.0)
     fdr_null: Literal["analytic", "formula"] | Path = "analytic"
     fdr_null_source: Literal["analytic", "empirical"] = "analytic"
@@ -427,11 +444,13 @@ class _Run:
         final = self.config.stages[-1].decision.threshold
         return self.config.fdr is not None and final == "auto"
 
-    def threshold(self, spec: StageSpec, n_pixels: int) -> float:
+    def threshold(self, spec: StageSpec, n_pixels: int, shift: float = 0.0) -> float:
         """The stage's threshold for a micrograph of ``n_pixels`` searched positions.
 
-        Its own, or the 1-FP formula's for ``"auto"``, lowered by ``fdr_reach``
-        (final stage) or ``fdr_gate_reach`` (earlier stages) when the FDR rule is on.
+        Its own, or for ``"auto"`` the 1-FP formula's. When the FDR rule is on, an
+        ``"auto"`` threshold is moved by ``shift`` (the anchor, :meth:`prepare_fdr`)
+        and lowered by ``fdr_reach`` (final stage) or ``fdr_gate_reach`` (earlier
+        stages).
         """
         if spec.decision.threshold != "auto":
             return float(spec.decision.threshold)
@@ -439,7 +458,31 @@ class _Run:
         if not self.fdr_active:
             return t
         final = spec is self.config.stages[-1]
-        return t - (self.config.fdr_reach if final else self.config.fdr_gate_reach)
+        reach = self.config.fdr_reach if final else self.config.fdr_gate_reach
+        return t + shift - reach
+
+    def prepare_fdr(
+        self, n_pixels: int, name: str = "", micrograph: Micrograph | None = None
+    ) -> FdrNull:
+        """The micrograph's FDR null, and where it anchors the ``"auto"`` thresholds.
+
+        Computed before the search: with ``fdr_anchor: null`` every ``"auto"``
+        threshold moves by the null's 1-FP cut minus the formula's (``shift``), so
+        the stages keep the pixels an FDR cut under this null can reach.
+        """
+        rate, record = self._fdr_null(n_pixels, name, micrograph)
+        final = self.config.stages[-1]
+        formula = zscore_threshold(n_pixels, self.n_hypotheses(final))
+        anchor: dict[str, Any] = {"anchor": "formula", "formula_cut_1fp": formula}
+        shift = 0.0
+        if self.config.fdr_anchor == "null" and rate is not None:
+            cut = null_cut_1fp(rate)
+            if cut is None:
+                anchor["anchor_note"] = "the null has no 1-FP crossing"
+            else:
+                shift = cut - formula
+                anchor.update(anchor="null", anchor_cut_1fp=cut, anchor_shift=shift)
+        return FdrNull(rate, {**(record or {"null": "formula"}), **anchor}, shift)
 
     def apply_fdr(
         self,
@@ -447,26 +490,32 @@ class _Run:
         n_pixels: int,
         name: str = "",
         micrograph: Micrograph | None = None,
+        prepared: FdrNull | None = None,
     ) -> tuple[SearchResult, dict]:
         """Keep ACCEPTED only the peaks above the micrograph's BH threshold.
 
-        ``n_pixels`` is the micrograph's searched positions (under its mask). The
-        null is ``fdr_null``'s: the analytic null of ``micrograph`` (the prepared
-        one), ``name``'s from a null summary, or the formula's.
+        ``n_pixels`` is the micrograph's searched positions (under its mask).
+        ``prepared`` is the null the search's thresholds were set with
+        (:meth:`prepare_fdr`); without it the null is computed here and the floor
+        is the formula's (a search run with the unmoved thresholds). The null is
+        ``fdr_null``'s: the analytic null of ``micrograph`` (the prepared one),
+        ``name``'s from a null summary, or the formula's.
         """
         final = self.config.stages[-1]
         assert self.config.fdr is not None
-        rate, record = self._fdr_null(n_pixels, name, micrograph)
+        if prepared is None:
+            rate, record = self._fdr_null(n_pixels, name, micrograph)
+            prepared = FdrNull(rate, record or {"null": "formula"}, 0.0)
         return apply_fdr(
             result,
             q=self.config.fdr,
             n_positions=n_pixels,
             n_hypotheses=self.n_hypotheses(final),
-            floor=self.threshold(final, n_pixels),
+            floor=self.threshold(final, n_pixels, prepared.shift),
             peak_radius=self.config.fdr_peak_radius,
             absorb_radius=final.decision.absorb_radius,
-            rate=rate,
-            null_record=record,
+            rate=prepared.rate,
+            null_record=prepared.record,
         )
 
     def _fdr_null(
@@ -534,14 +583,20 @@ class _Run:
         )
         return int(geometry.grid_mask(micrograph.mask).sum())
 
-    def thresholds(self, micrograph: Micrograph) -> list[float | None] | None:
-        """Per-stage thresholds of a masked micrograph (``None``: the searcher's)."""
-        if micrograph.mask is None:
+    def thresholds(
+        self, micrograph: Micrograph, shift: float = 0.0
+    ) -> list[float | None] | None:
+        """Per-stage thresholds of a masked or FDR-anchored micrograph.
+
+        ``shift`` moves every ``"auto"`` threshold (:meth:`prepare_fdr`). ``None``:
+        the searcher's own (no mask, no shift).
+        """
+        if micrograph.mask is None and shift == 0.0:
             return None
         n_pixels = self.n_searchable(micrograph)
         return [
             (
-                self.threshold(spec, n_pixels)
+                self.threshold(spec, n_pixels, shift)
                 if spec.decision.threshold == "auto"
                 else None
             )
@@ -781,19 +836,33 @@ def run(config: SearchConfig) -> dict[str, Path]:
                     summary_path.write_text(json.dumps(summary, indent=1))
                     continue
                 t2 = time.perf_counter()
+                prepared = None
+                if state.fdr_active:  # the null first: it anchors the thresholds
+                    prepared = state.prepare_fdr(
+                        state.n_searchable(micrograph), name, micrograph
+                    )
+                t2b = time.perf_counter()
+                timing["fdr_null_s"] = t2b - t2
                 result = state.searcher(shape).run(
-                    micrograph, thresholds=state.thresholds(micrograph)
+                    micrograph,
+                    thresholds=state.thresholds(
+                        micrograph, 0.0 if prepared is None else prepared.shift
+                    ),
                 )
-                if state.fdr_active:
+                if prepared is not None:
                     result, state.fdr_reports[name] = state.apply_fdr(
-                        result, state.n_searchable(micrograph), name, micrograph
+                        result,
+                        state.n_searchable(micrograph),
+                        name,
+                        micrograph,
+                        prepared,
                     )
                 t3 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device
                 result = result.to("cpu")
                 timing["read_wait_s"] = t1 - t0
                 timing["prepare_s"] = t2 - t1
-                timing["search_s"] = t3 - t2
+                timing["search_s"] = t3 - t2b  # the search and the FDR cut
                 timing["handoff_s"] = time.perf_counter() - t3
                 pending.append(
                     writer.submit(

@@ -17,6 +17,7 @@ from panther_em.managers.fdr import (
     bh_threshold,
     calibrated_null_rate,
     expected_false_peaks,
+    null_cut_1fp,
 )
 from panther_em.search import PixelLabel, SearchResult
 
@@ -85,6 +86,11 @@ def test_thresholds_lowered_only_when_active(pipeline, tmp_path):
             assert on.threshold(spec, n_pixels) == pytest.approx(
                 off.threshold(spec, n_pixels) - reach
             )
+            # the anchor moves every auto threshold, only when the rule is on
+            assert on.threshold(spec, n_pixels, -0.2) == pytest.approx(
+                off.threshold(spec, n_pixels) - reach - 0.2
+            )
+            assert off.threshold(spec, n_pixels, -0.2) == off.threshold(spec, n_pixels)
     assert on.fdr_active and not off.fdr_active
     on.release()
     off.release()
@@ -118,6 +124,22 @@ def test_fdr_search(pipeline, tmp_path):
     summary = json.loads((tmp_path / "plain" / "search_summary.json").read_text())
     assert all("fdr" not in summary[name] for name in module.NAMES)
     assert sorted(plain) == list(module.NAMES)
+
+
+def test_null_cut_1fp():
+    """The z at which a null rate falls to one false peak, and when there is none."""
+
+    def exponential(z):
+        return 1000.0 * np.exp(-3.0 * (np.asarray(z, float) - 6.0))
+
+    assert null_cut_1fp(exponential) == pytest.approx(
+        6.0 + np.log(1000.0) / 3.0, abs=1e-4
+    )
+    assert null_cut_1fp(lambda z: np.full(np.shape(z), 0.5)) is None  # never above one
+    assert null_cut_1fp(lambda z: np.full(np.shape(z), 5.0)) is None  # never below one
+    # infinite below the curve (a summary's rate), still a crossing
+    cut = null_cut_1fp(lambda z: np.where(np.asarray(z) < 7.0, np.inf, 0.1))
+    assert cut == pytest.approx(7.0, abs=2e-3)
 
 
 def test_bh_threshold_is_the_shared_rule():
@@ -218,6 +240,25 @@ def test_fdr_null_analytic_is_computed_by_the_search(pipeline, tmp_path, monkeyp
     assert np.isfinite(rep["null_cut_1fp"]) and rep["null_seconds"] > 0
     if rep["threshold"] is not None:
         assert rep["expected_false_picks"] < rep["expected_false_picks_formula"]
+    # the reach is measured from the null's own 1-FP cut (fdr_anchor: null)
+    assert rep["anchor"] == "null"
+    assert rep["anchor_cut_1fp"] == pytest.approx(rep["null_cut_1fp"], abs=0.01)
+    assert rep["anchor_shift"] == pytest.approx(
+        rep["anchor_cut_1fp"] - rep["formula_cut_1fp"]
+    )
+    assert rep["floor"] == pytest.approx(rep["anchor_cut_1fp"] - base.fdr_reach)
+    assert isinstance(rep["floor_limited"], bool)
+
+    search.run(
+        one.model_copy(
+            update={"output_dir": tmp_path / "formula_anchor", "fdr_anchor": "formula"}
+        )
+    )
+    rep = json.loads((tmp_path / "formula_anchor" / "search_summary.json").read_text())[
+        name
+    ]["fdr"]
+    assert rep["null"] == "analytic" and rep["anchor"] == "formula"
+    assert rep["floor"] == pytest.approx(rep["formula_cut_1fp"] - base.fdr_reach)
 
     search.run(
         one.model_copy(
@@ -229,6 +270,8 @@ def test_fdr_null_analytic_is_computed_by_the_search(pipeline, tmp_path, monkeyp
     ]
     assert rep["null"] == "formula"
     assert rep["expected_false_picks"] == rep["expected_false_picks_formula"]
+    assert rep["anchor"] == "formula"  # nothing to anchor on
+    assert rep["floor"] == pytest.approx(rep["formula_cut_1fp"] - base.fdr_reach)
 
     from panther_em.managers import null as null_program
 
