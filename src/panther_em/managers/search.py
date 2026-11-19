@@ -41,7 +41,7 @@ from panther_em.managers._common import (
     read_micrograph,
     save_output,
 )
-from panther_em.managers.fdr import apply_fdr
+from panther_em.managers.fdr import apply_fdr, calibrated_null_rate
 from panther_em.search import (
     Calibration,
     Decision,
@@ -211,6 +211,14 @@ class SearchConfig(ProgramConfig):
     fdr_peak_radius : float
         Minimum distance between the peaks the FDR rule counts, pixels. Default 10
         (the particle export's ``peak_radius``).
+    fdr_null : Path, optional
+        A ``null_summary.json`` of ``panther-em null`` for this search config: each
+        micrograph's FDR null is then its calibrated null (scaled to its searched
+        positions) instead of the formula's. A micrograph the summary lacks keeps the
+        formula (reported).
+    fdr_null_source : {"analytic", "empirical"}
+        Which calibrated null: the analytic prediction (default) or the
+        phase-randomised copies' rate table.
     """
 
     program: ClassVar[str] = "search"
@@ -238,6 +246,8 @@ class SearchConfig(ProgramConfig):
     fdr_reach: float = Field(default=0.5, ge=0.0)
     fdr_gate_reach: float = Field(default=0.25, ge=0.0)
     fdr_peak_radius: float = Field(default=10.0, gt=0.0)
+    fdr_null: Path | None = None
+    fdr_null_source: Literal["analytic", "empirical"] = "analytic"
 
     @model_validator(mode="after")
     def _links(self) -> SearchConfig:
@@ -411,14 +421,24 @@ class _Run:
         return t - (self.config.fdr_reach if final else self.config.fdr_gate_reach)
 
     def apply_fdr(
-        self, result: SearchResult, n_pixels: int
+        self, result: SearchResult, n_pixels: int, name: str = ""
     ) -> tuple[SearchResult, dict]:
         """Keep ACCEPTED only the peaks above the micrograph's BH threshold.
 
-        ``n_pixels`` is the micrograph's searched positions (under its mask).
+        ``n_pixels`` is the micrograph's searched positions (under its mask); the
+        null is ``name``'s calibrated one with ``fdr_null`` set, else the formula's.
         """
         final = self.config.stages[-1]
         assert self.config.fdr is not None
+        rate, record = None, None
+        if self.config.fdr_null is not None:
+            found = calibrated_null_rate(
+                self.config.fdr_null, name, n_pixels, self.config.fdr_null_source
+            )
+            if found is None:
+                record = {"null": "formula", "note": f"no calibrated null for {name}"}
+            else:
+                rate, record = found
         return apply_fdr(
             result,
             q=self.config.fdr,
@@ -427,6 +447,8 @@ class _Run:
             floor=self.threshold(final, n_pixels),
             peak_radius=self.config.fdr_peak_radius,
             absorb_radius=final.decision.absorb_radius,
+            rate=rate,
+            null_record=record,
         )
 
     def n_positions(self, shape: tuple[int, int]) -> int:
@@ -695,7 +717,7 @@ def run(config: SearchConfig) -> dict[str, Path]:
                 )
                 if state.fdr_active:
                     result, state.fdr_reports[name] = state.apply_fdr(
-                        result, state.n_searchable(micrograph)
+                        result, state.n_searchable(micrograph), name
                     )
                 t3 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device

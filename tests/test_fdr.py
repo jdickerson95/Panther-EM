@@ -6,12 +6,18 @@ import importlib.util
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+from leopard_em.analysis.fdr import bh_cutoff, nominal_null_rate
 from scipy.special import ndtri
 
 from panther_em.managers import SearchConfig, search
-from panther_em.managers.fdr import bh_threshold, expected_false_peaks
+from panther_em.managers.fdr import (
+    bh_threshold,
+    calibrated_null_rate,
+    expected_false_peaks,
+)
 from panther_em.search import PixelLabel, SearchResult
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -112,3 +118,79 @@ def test_fdr_search(pipeline, tmp_path):
     summary = json.loads((tmp_path / "plain" / "search_summary.json").read_text())
     assert all("fdr" not in summary[name] for name in module.NAMES)
     assert sorted(plain) == list(module.NAMES)
+
+
+def test_bh_threshold_is_the_shared_rule():
+    """Panther-EM's cut is Leopard-EM's engine-agnostic BH rule under its null."""
+    rng = np.random.default_rng(0)
+    z = torch.from_numpy(
+        np.concatenate([rng.normal(9, 1, 50), 6 + rng.exponential(0.3, 3000)])
+    )
+    n_pos, n_hyp = 9000, 10**8
+    shared = bh_cutoff(z.numpy(), nominal_null_rate(n_pos * n_hyp), 0.05)
+    assert bh_threshold(z, n_pos, n_hyp, 0.05) == shared.bh_threshold
+
+    def lower(t):  # a calibrated null below the formula: a lower cut
+        return 0.2 * nominal_null_rate(n_pos * n_hyp)(t)
+
+    assert bh_threshold(z, n_pos, n_hyp, 0.05, lower) <= shared.bh_threshold
+
+
+def _null_summary(path, name, valid_area, scale):
+    """A ``panther-em null`` summary: one micrograph's analytic and counted nulls."""
+    t = np.round(np.arange(2.0, 10.0, 0.01), 3)
+    rate = scale * 1e9 * 0.5 * np.exp(-0.5 * t**2) / 2.5066 / t  # ~ N Q(t)
+    path.write_text(
+        json.dumps(
+            {
+                "micrographs": {
+                    name: {
+                        "valid_area": valid_area,
+                        "analytic": {"thresholds": t.tolist(), "rate": rate.tolist()},
+                        "rate": {
+                            "thresholds": t[400:].tolist(),
+                            "rate": rate[400:].tolist(),
+                        },
+                    }
+                }
+            }
+        )
+    )
+    return t, rate
+
+
+def test_calibrated_null_rate(tmp_path):
+    path = tmp_path / "null_summary.json"
+    t, rate = _null_summary(path, "m0", 1000, 1.0)
+    rate_fn, record = calibrated_null_rate(path, "m0", 2000, "analytic")
+    assert rate_fn(np.array([t[300]]))[0] == pytest.approx(2 * rate[300])
+    assert record["null"] == "analytic" and record["area_scale"] == 2.0
+    counted, _ = calibrated_null_rate(path, "m0", 1000, "empirical")
+    assert np.isinf(counted(np.array([5.0]))[0])  # below the copies' table
+    assert counted(np.array([t[500]]))[0] == pytest.approx(rate[500])
+    assert calibrated_null_rate(path, "nope", 1000) is None
+
+
+def test_fdr_search_with_a_calibrated_null(pipeline, tmp_path):
+    """``fdr_null``: a micrograph's cut under its calibrated null, the rest formula."""
+    module, out = pipeline
+    base = SearchConfig.from_yaml(out / "search.yaml")
+    name = module.PARTICLE["micrograph"]
+    summary_path = tmp_path / "null_summary.json"
+    _null_summary(summary_path, name, 9000, 1e-3)  # a null far below the formula
+    done = search.run(
+        base.model_copy(
+            update={"output_dir": tmp_path / "cal", "fdr_null": summary_path}
+        )
+    )
+    summary = json.loads((tmp_path / "cal" / "search_summary.json").read_text())
+    rep = summary[name]["fdr"]
+    assert rep["null"] == "analytic" and rep["null_summary"] == str(summary_path)
+    if rep["threshold"] is not None:
+        assert rep["expected_false_picks"] < rep["expected_false_picks_formula"]
+    others = [n for n in module.NAMES if n != name]
+    assert all(summary[n]["fdr"]["null"] == "formula" for n in others)
+    assert all("note" in summary[n]["fdr"] for n in others)
+    result = SearchResult.load(done[name])
+    r, c = module.PARTICLE["top_left"]
+    assert int(result.label[0, r, c]) == int(PixelLabel.ACCEPTED)

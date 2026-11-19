@@ -18,22 +18,34 @@ After the search, per micrograph (`panther_em.managers.fdr`):
 1. **Peaks:** local maxima at least `fdr_peak_radius` (10) pixels apart among the ACCEPTED
    pixels, found with the particle export's peak finder, so `k` counts what the export
    writes.
-2. **Null:** the expected number of false peaks above `t` is the formula's
+2. **Null:** the expected number of false peaks above `t`. By default it is the formula's
    `λ(t) = N_positions × N_hypotheses × Q(t)`, the same count that sets the 1-FP threshold.
    `N_positions` is the micrograph's searched positions (under its mask, if it has one).
+   With `fdr_null` it is the micrograph's calibrated null (below).
 3. **Threshold:** with peak z sorted high to low, the cut is `z_(k)` for the largest `k`
-   with `λ(z_(k)) ≤ 0.05 k` (BH step-up, π0 = 1). No such `k` means no picks.
+   with `λ(z_(k)) ≤ 0.05 k` (BH step-up, π0 = 1). No such `k` means no picks. The rule is
+   Leopard-EM's engine-agnostic `leopard_em.analysis.fdr.bh_cutoff`.
 4. **Relabel:** ACCEPTED pixels below the cut become REJECTED; ABSORBED pixels no longer
    within the final stage's `absorb_radius` of an ACCEPTED pixel become AMBIGUOUS. The run
    summary (`search_summary.json`) gets an `fdr` record per micrograph: the BH threshold,
-   the applied threshold, whether it was capped, peaks considered and picked, and the
-   formula's expected false picks at the cut.
+   the applied threshold, whether it was capped, peaks considered and picked, the null
+   used, and the expected false picks at the cut under it and under the formula.
 
 **Why the formula null.** It needs no extra searches. Panther's trials are correlated, so
 the formula over-counts false peaks: with after-CTF normalization the measured null on
 xenon_131 is 0.37 (B 0) to 0.14 (B 120) of it. The realised FDR is therefore below 5 %;
-see Validation. A threshold calibrated on phase-randomised nulls sits lower still and picks
-more (`docs/after_ctf_normalization.md`, section 5); that is not automated here.
+see Validation. A calibrated null gives the cut the FDR asks for:
+
+**Calibrated null (`fdr_null`).** Point `fdr_null` at the `null_summary.json` of
+`panther-em null` (`docs/null_calibration.md`), run for the same search config. Each
+micrograph's λ is then its own calibrated null: the analytic prediction
+(`fdr_null_source: analytic`, the default, ~20 s per micrograph on a GPU), or the
+phase-randomised copies' rate table (`empirical`). It is scaled from the null's valid area
+to the micrograph's searched positions. A micrograph the summary lacks keeps the formula,
+and its record says so. On xenon_131's Leopard-EM searches, the same rule with the analytic
+null picks about 30 more particles at 5 % than the 1-FP threshold does (Leopard-EM's
+validation). For thresholds on z after Leopard-EM's refinement, use the summary's
+`analytic_refined` prediction with `leopard_em.analysis.bh_cutoff` on the refined z.
 
 ## Reach: the stages must look below the old threshold
 
@@ -111,6 +123,8 @@ fdr: 0.05            # null: the old fixed 1-FP threshold
 fdr_reach: 0.5       # floor of the FDR cut below the 1-FP threshold, z
 fdr_gate_reach: 0.25 # how far the stage-1 gate is lowered, z
 fdr_peak_radius: 10  # peak separation for counting, pixels
+# fdr_null: nulls/null_summary.json  # a calibrated null from `panther-em null`
+# fdr_null_source: analytic          # or empirical (the phase-randomised copies)
 ```
 
 `fdr: null` with `normalization: before_ctf` reproduces results from before both changes.
@@ -119,8 +133,8 @@ fdr_peak_radius: 10  # peak separation for counting, pixels
 
 | File | Change |
 |---|---|
-| `src/panther_em/managers/fdr.py` | New: the formula null, the BH threshold, the relabelling |
-| `src/panther_em/managers/search.py` | `SearchConfig.fdr`, `fdr_reach`, `fdr_gate_reach`, `fdr_peak_radius`; `_Run.n_hypotheses`, `fdr_active`, `apply_fdr`; lowered `auto` thresholds (masked micrographs included); `fdr` record in the summary |
-| `tests/test_fdr.py` | New: the formula, BH step-up, no-pick case, thresholds lowered only when active, end-to-end search |
+| `src/panther_em/managers/fdr.py` | New: the formula null, the calibrated null from a `panther-em null` summary, the BH threshold (Leopard-EM's `bh_cutoff`), the relabelling |
+| `src/panther_em/managers/search.py` | `SearchConfig.fdr`, `fdr_reach`, `fdr_gate_reach`, `fdr_peak_radius`, `fdr_null`, `fdr_null_source`; `_Run.n_hypotheses`, `fdr_active`, `apply_fdr`; lowered `auto` thresholds (masked micrographs included); `fdr` record in the summary |
+| `tests/test_fdr.py` | New: the formula, BH step-up (the shared rule), no-pick case, the calibrated null (area scaling, missing micrograph), thresholds lowered only when active, end-to-end search with the formula and with a calibrated null |
 | `tests/test_managers.py` | `test_export_stack`: a lone particle's accepted region may now be its peak pixel only; `test_masked_search`: the `auto` thresholds are lowered by the reach, and the FDR null counts the searchable positions only |
 | `docs/after_ctf_normalization.md` | Points to this file |
