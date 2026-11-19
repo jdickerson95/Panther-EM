@@ -54,11 +54,13 @@ search.
 
 from __future__ import annotations
 
+import copy
 import math
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import healpy as hp
 import numpy as np
 import roma
 import torch
@@ -66,10 +68,14 @@ from leopard_em.analysis.analytic_null import (
     AnalyticNullPrediction,
     AxisNeighbours,
     PowerWeighting,
+    RefinedNullPrediction,
+    RefinementWindow,
     estimate_kappa,
     estimate_mean_template,
     predict_null_rate,
+    predict_refined_null_rate,
     sample_lattice,
+    sample_refinement_gain,
 )
 
 from panther_em.decomposition.projections import (
@@ -87,12 +93,14 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_THRESHOLDS",
+    "SearchTemplates",
     "TemplateProjector",
     "haar_rotations",
     "healpix_nside",
     "lag_grid_planes",
     "lattice_neighbours",
     "predict_null",
+    "predict_refined_null",
     "reference_grid",
 ]
 
@@ -341,6 +349,45 @@ class TemplateProjector:
         """Searched CTF planes ``D``."""
         return int(self.ctf.shape[0])
 
+    @torch.no_grad()
+    def box_filtered(
+        self, rotations: torch.Tensor, filters: torch.Tensor
+    ) -> torch.Tensor:
+        """``(F, n, Ly, Lx // 2 + 1)`` projections under filters applied in the box.
+
+        Each of the ``(F, d, d // 2 + 1)`` filters (e.g. whitening x CTF) multiplies
+        the projection's rfft on the template box, as Leopard-EM's refine_template
+        filters its templates, so whatever the CTF delocalises past the box wraps
+        around it. No normalisation, support mask, row factor or lag-grid CTF.
+        """
+        rot = rotations.to(self.device, torch.float32)
+        projections = project_from_precomputed_dft(self.dft, rot, self.edge, self.pad)
+        spectrum = torch.fft.rfft2(projections)
+        box = tuple(int(v) for v in projections.shape[-2:])
+        out = [
+            self.weighting.transform(
+                torch.fft.irfft2(spectrum * f.to(self.device, torch.float32), s=box)
+            )
+            for f in filters
+        ]
+        return torch.stack(out)
+
+    def with_filter(
+        self, template_filter: torch.Tensor, *, normalize: bool = False
+    ) -> TemplateProjector:
+        """A projector of the same volume under another filter, sharing its DFT.
+
+        No support mask and no after-CTF row factor: e.g. refinement's templates under
+        the whitening alone.
+        """
+        other = copy.copy(self)
+        other.filter = template_filter.to(self.device, torch.float32)
+        other.normalize = bool(normalize)
+        other.support = None
+        other.reference = None
+        other.white = 1.0
+        return other
+
     def row_scale(self, templates: torch.Tensor) -> torch.Tensor | None:
         """``(n,)`` after-CTF row factor of ``(n, d, d)`` templates (or ``None``).
 
@@ -356,8 +403,14 @@ class TemplateProjector:
         return scale
 
     @torch.no_grad()
-    def __call__(self, rotations: torch.Tensor) -> torch.Tensor:
-        """``(D, n, Ly, Lx // 2 + 1)`` templates of ``(n, 3, 3)`` rotations."""
+    def __call__(
+        self, rotations: torch.Tensor, ctf: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``(D, n, Ly, Lx // 2 + 1)`` templates of ``(n, 3, 3)`` rotations.
+
+        ``ctf`` (``(D', Ly, Lx // 2 + 1)`` on the lag grid) replaces the searched
+        planes, e.g. a refinement's defocus offsets.
+        """
         rot = rotations.to(self.device, torch.float32)
         projections = project_from_precomputed_dft(self.dft, rot, self.edge, self.pad)
         m = apply_fourier_filters(projections, self.filter[None])[0]
@@ -366,11 +419,25 @@ class TemplateProjector:
             m = (m - mean) / torch.sqrt(var + 1e-8)
         if self.support is not None:
             m = m * self.support
+        return self.project_templates(m, ctf)
+
+    @torch.no_grad()
+    def project_templates(
+        self, templates: torch.Tensor, ctf: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``(D, n, Ly, Lx // 2 + 1)`` of ``(n, d, d)`` real-space search templates.
+
+        The after-CTF row factor, the lag grid and the planes, as :meth:`__call__`
+        applies them to the exact templates; e.g. for the decomposition's own
+        reconstructions (:class:`SearchTemplates`).
+        """
+        m = templates.to(self.device, torch.float32)
         scale = self.row_scale(m)
         if scale is not None:
             m = m * scale[:, None, None]
         q: torch.Tensor = self.weighting.transform(m)
-        return q[None] * self.ctf[:, None]
+        planes = self.ctf if ctf is None else ctf.to(self.device, torch.float32)
+        return q[None] * planes[:, None]
 
 
 def _batches(rotations: torch.Tensor, size: int) -> Iterator[torch.Tensor]:
@@ -388,6 +455,43 @@ class _Sampler:
     def pairs(self, n_pairs: int, size: int) -> Iterator[tuple[Any, Any]]:
         for _ in range(n_pairs):
             yield self.rotations(size), self.rotations(size)
+
+
+def _projector(
+    micrograph: Micrograph,
+    volume: torch.Tensor | np.ndarray,
+    template_filter: torch.Tensor,
+    *,
+    planes: Sequence[int] | None,
+    n_filters: int,
+    support: torch.Tensor | None,
+    normalize_projections: bool,
+    reference: torch.Tensor | None,
+    device: torch.device,
+) -> tuple[PowerWeighting, TemplateProjector]:
+    """The image's lag-grid power weighting and the search's template projector."""
+    if n_filters != 1:
+        raise NotImplementedError(
+            "the analytic null models decompositions with one Fourier filter"
+        )
+    image_shape = micrograph.image_shape
+    box = (int(template_filter.shape[0]), int(template_filter.shape[0]))
+    weighting = PowerWeighting(
+        torch.fft.rfft2(micrograph.image.to(device, torch.float32)), image_shape, box
+    ).to(device)
+    ctf = micrograph.ctf if planes is None else micrograph.ctf[list(planes)]
+    lag_ctf = lag_grid_planes(ctf.to(device), image_shape, weighting.lag_shape)
+    project = TemplateProjector(
+        volume,
+        template_filter,
+        weighting,
+        lag_ctf,
+        support=support,
+        normalize=normalize_projections,
+        reference=reference,
+        device=device,
+    )
+    return weighting, project
 
 
 # pylint: disable=too-many-locals
@@ -469,29 +573,20 @@ def predict_null(
         micrograph; ``.as_dict()`` the JSON record.
     """
     start = time.time()
-    if n_filters != 1:
-        raise NotImplementedError(
-            "the analytic null models decompositions with one Fourier filter"
-        )
     device = torch.device(device)
-    image = micrograph.image
     image_shape = micrograph.image_shape
-    box = (int(template_filter.shape[0]), int(template_filter.shape[0]))
-    weighting = PowerWeighting(
-        torch.fft.rfft2(image.to(device, torch.float32)), image_shape, box
-    ).to(device)
-    ctf = micrograph.ctf if planes is None else micrograph.ctf[list(planes)]
-    lag_ctf = lag_grid_planes(ctf.to(device), image_shape, weighting.lag_shape)
-    project = TemplateProjector(
+    weighting, project = _projector(
+        micrograph,
         volume,
         template_filter,
-        weighting,
-        lag_ctf,
+        planes=planes,
+        n_filters=n_filters,
         support=support,
-        normalize=normalize_projections,
+        normalize_projections=normalize_projections,
         reference=reference,
         device=device,
     )
+    box = project.box
     n_planes = project.n_planes
     sampler = _Sampler(torch.Generator().manual_seed(int(seed)))
 
@@ -544,3 +639,388 @@ def predict_null(
         details=record,
     )
     return prediction
+
+
+class SearchTemplates:
+    """The search's own templates: the decomposition's reconstructions at grid points.
+
+    The SVD reconstruction ``m~`` of a grid point (orientation row, in-plane angle)
+    from the feature rectangles a stage keeps, warped to the Cartesian box as the
+    search's kernels are. This is what the search correlates, so it carries the
+    rank truncation and the polar warp (and the warp's centre) that the exact
+    projections of :class:`TemplateProjector` do not.
+
+    Parameters
+    ----------
+    reconstructor : Reconstructor
+        The decomposition's (``Template.reconstructor``).
+    rectangles : sequence of Rectangle
+        The stage's ``(k_start, m_start, k_extent, m_extent)`` feature rectangles.
+    fourier_filter : int
+        The decomposition's Fourier filter row. Default 0.
+    """
+
+    def __init__(
+        self,
+        reconstructor: Any,
+        rectangles: Sequence[Sequence[int]],
+        fourier_filter: int = 0,
+    ) -> None:
+        result = reconstructor.result.to_dense()
+        if result.num_volumes != 1 or result.is_complex_projection:
+            raise NotImplementedError(
+                "search templates of one real-projection volume only"
+            )
+        self.reconstructor = reconstructor
+        self.device = reconstructor.device
+        k_stop = max(int(r[0]) + int(r[2]) for r in rectangles)
+        e_stop = max(int(r[1]) + int(r[3]) for r in rectangles)
+        mask = torch.zeros((k_stop, e_stop))
+        for k0, m0, ke, me in rectangles:
+            mask[k0 : k0 + ke, m0 : m0 + me] = 1.0
+        s = torch.as_tensor(np.asarray(result.S)[:k_stop, :e_stop]) * mask
+        vh = torch.as_tensor(np.asarray(result.Vh)[:k_stop, :e_stop])
+        self.weighted_vh = (s[..., None] * vh).to(self.device, torch.complex64)
+        u = torch.as_tensor(np.asarray(result.U))  # (1, FF, O, K, E)
+        self.u = u[0, int(fourier_filter), :, :k_stop, :e_stop]
+        self.k = torch.arange(k_stop, device=self.device, dtype=torch.float32)
+        self.n_angle = int(result.num_angular_components)
+        self.phi = torch.as_tensor(np.asarray(result.phi_values, np.float64))
+        self.theta = torch.as_tensor(np.asarray(result.theta_values, np.float64))
+
+    @property
+    def n_orientations(self) -> int:
+        """Orientation rows of the decomposition."""
+        return int(self.u.shape[0])
+
+    def rotations(
+        self, orientation: torch.Tensor, psi_deg: torch.Tensor
+    ) -> torch.Tensor:
+        """``(n, 3, 3)`` float32 rotations of grid points (ZYZ phi, theta, psi)."""
+        angles = torch.stack(
+            [
+                self.phi[orientation.cpu()],
+                self.theta[orientation.cpu()],
+                psi_deg.cpu().double(),
+            ],
+            dim=-1,
+        )
+        rotation: torch.Tensor = roma.euler_to_rotmat("ZYZ", angles, degrees=True)
+        return rotation.to(torch.float32)
+
+    @torch.no_grad()
+    def __call__(
+        self, orientation: torch.Tensor, psi_deg: torch.Tensor
+    ) -> torch.Tensor:
+        """``(n, d, d)`` float32 reconstructions of grid points."""
+        u = self.u[orientation.cpu()].to(self.device, torch.complex64)  # (n, K, E)
+        blocks = torch.einsum("nke,ker->nkr", u, self.weighted_vh)
+        # the in-plane angle is a phase per angular frequency k
+        angle = torch.deg2rad(psi_deg.to(self.device, torch.float32))
+        blocks = blocks * torch.exp(1j * self.k[None, :] * angle[:, None])[..., None]
+        polar = torch.fft.irfft(blocks, n=self.n_angle, dim=1, norm="ortho")
+        cartesian = self.reconstructor.to_cartesian(polar.to(torch.float32))
+        out: torch.Tensor = cartesian.real.to(torch.float32)
+        return out
+
+
+def _neighbours(
+    nside: int,
+    n_psi: int,
+    orientation: int,
+    psi_index: int,
+    rings: int = 1,
+    psi_steps: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A grid point's neighbourhood: views x in-plane angles, without the point.
+
+    The HEALPix (NESTED) pixels within ``rings`` rings of its view, each at the
+    in-plane angles within ``psi_steps`` steps of its own.
+    """
+    views = {int(orientation)}
+    frontier = [int(orientation)]
+    for _ in range(int(rings)):
+        ring = hp.get_all_neighbours(int(nside), frontier, nest=True)
+        new = {int(v) for v in np.asarray(ring).reshape(-1) if int(v) >= 0} - views
+        views |= new
+        frontier = sorted(new)
+    orientations, psis = [], []
+    for view in sorted(views):
+        for step in range(-int(psi_steps), int(psi_steps) + 1):
+            if view == orientation and step == 0:
+                continue
+            orientations.append(view)
+            psis.append((psi_index + step) % n_psi)
+    return torch.as_tensor(orientations), torch.as_tensor(psis)
+
+
+# pylint: disable=too-many-locals,too-many-arguments,too-many-statements
+def predict_refined_null(
+    micrograph: Micrograph,
+    volume: torch.Tensor | np.ndarray,
+    template_filter: torch.Tensor,
+    signal_filter: torch.Tensor,
+    search: AnalyticNullPrediction,
+    search_templates: SearchTemplates,
+    *,
+    nside: int,
+    n_psi: int,
+    orientation_offsets: torch.Tensor | np.ndarray,
+    defocus_offsets: Sequence[float] | np.ndarray,
+    candidate_threshold: float,
+    refine_ctf: Callable[[np.ndarray], torch.Tensor],
+    plane_defocus: Sequence[float],
+    planes: Sequence[int] | None = None,
+    n_filters: int = 1,
+    support: torch.Tensor | None = None,
+    normalize_projections: bool = True,
+    reference: torch.Tensor | None = None,
+    shift_radius: int = 1,
+    condition_radius: int = 2,
+    neighbour_rings: int = 1,
+    neighbour_psi_steps: int = 1,
+    n_candidates: int = 8,
+    n_draws: int = 200_000,
+    n_mean_samples: int = 3000,
+    heights: np.ndarray | None = None,
+    batch_size: int = 11,
+    seed: int = 0,
+    device: torch.device | str = "cpu",
+    details: dict[str, Any] | None = None,
+) -> RefinedNullPrediction:
+    r"""Predict the null peak rate after Leopard-EM refines a search's candidates.
+
+    The candidates at or above ``candidate_threshold`` are exported and refined by
+    Leopard-EM's refine_template, which re-scores them with its own exact correlation
+    over a local window (:func:`leopard_em.analysis.analytic_null.refine_window` reads
+    its offsets) and normalises it by the search's per-pixel mean and standard
+    deviation (:mod:`panther_em.managers.leopard`). The refined null follows from the
+    gain of a null candidate conditioned on what the search established about it
+    (:mod:`leopard_em.analysis.analytic_null.refine`), with two kinds of score on the
+    same Gaussian field:
+
+    * the search's: Panther's own templates (the decomposition's reconstructions,
+      :class:`SearchTemplates`) of the candidate (its score is u) and of its grid
+      neighbours, which it beat: the eight HEALPix neighbours at its in-plane angle,
+      the in-plane angles either side, and the adjacent planes. On the z scale
+      :math:`(m^\sim - M) / \sigma`, with M the search's mean template and
+      :math:`\sigma` its field SD;
+    * refinement's: the exact projection at every window offset (``offset @ R``, as
+      refine_template composes them; defocus offsets about the candidate's plane)
+      under the whitening alone (``signal_filter``, refine_template's full band),
+      at unit variance as refine_template normalises it, less :math:`M / \sigma`.
+
+    The gap between the two (rank truncation, polar warp, band limit) is what moves
+    a candidate's refined z below its search z at the same pose.
+
+    Parameters
+    ----------
+    micrograph : Micrograph
+        As for :func:`predict_null`.
+    volume : torch.Tensor or numpy.ndarray
+        As for :func:`predict_null`.
+    template_filter : torch.Tensor
+        As for :func:`predict_null` (``W_avg * band``).
+    signal_filter : torch.Tensor
+        ``(d, d // 2 + 1)`` the whitening alone, ``W_avg``
+        (``WhiteningFilter.average_filter``), for refinement's templates.
+    search : AnalyticNullPrediction
+        The search's prediction (:func:`predict_null`).
+    search_templates : SearchTemplates
+        The final stage's reconstructions.
+    nside, n_psi : int
+        The searched HEALPix grid and in-plane angles.
+    orientation_offsets : torch.Tensor or numpy.ndarray
+        Refinement's ZYZ Euler offsets ``(n, 3)``, degrees, including zero.
+    defocus_offsets : sequence of float
+        Refinement's defocus offsets about the candidate's plane, A, including zero.
+    candidate_threshold : float
+        Panther z-score at or above which candidates are refined.
+    refine_ctf : callable
+        Maps defocus offsets (A, relative to the micrograph's defocus, as the search
+        config's ``defocus_offsets``) to ``(n, d, d // 2 + 1)`` CTF planes on the
+        template box, as refine_template builds them: it filters its templates in
+        the box, while the search applies the CTF to the whole image.
+    plane_defocus : sequence of float
+        Relative defocus of each searched plane (``planes`` order), A.
+    planes : sequence of int, optional
+        As for :func:`predict_null`.
+    n_filters : int
+        As for :func:`predict_null`.
+    support : torch.Tensor, optional
+        As for :func:`predict_null`.
+    normalize_projections : bool
+        As for :func:`predict_null`.
+    reference : torch.Tensor, optional
+        As for :func:`predict_null`.
+    shift_radius : int
+        Positions refinement scores about each candidate, +-pixels. Default 1 (on
+        xenon_131, +-2 px gives the same gains within 0.03 z at 2.5x the cost).
+    condition_radius : int
+        Positions at which the candidate beat its grid neighbours, +-pixels.
+        Default 2.
+    neighbour_rings, neighbour_psi_steps : int
+        The grid neighbourhood it beat: the HEALPix views within ``neighbour_rings``
+        rings, each at the in-plane angles within ``neighbour_psi_steps`` steps (and
+        its own view and angle on the adjacent planes). Default 1 and 1.
+    n_candidates : int
+        Grid points sampled as candidates, spread evenly over the planes. Default 8.
+    n_draws : int
+        Gaussian draws per candidate. Default 200,000.
+    n_mean_samples : int
+        Rotations for the mean template (with the same ``seed``, the search
+        prediction's). Default 3000.
+    heights : numpy.ndarray, optional
+        Candidate heights to sample the gain at; default 5 to 9 in steps of 0.5.
+    batch_size : int
+        Rotations projected per batch. Default 11.
+    seed : int
+        Seed of the sampled grid points and draws.
+    device : torch.device or str
+        Where the projections and draws are computed.
+    details : dict, optional
+        Extras recorded in the prediction's ``details``.
+
+    Returns
+    -------
+    RefinedNullPrediction
+        ``.zscore_cutoff(fp)`` is the predicted threshold on refined z-scores.
+    """
+    start = time.time()
+    device = torch.device(device)
+    weighting, project = _projector(
+        micrograph,
+        volume,
+        template_filter,
+        planes=planes,
+        n_filters=n_filters,
+        support=support,
+        normalize_projections=normalize_projections,
+        reference=reference,
+        device=device,
+    )
+    n_planes = project.n_planes
+    plane_defocus = [float(v) for v in plane_defocus]
+    if len(plane_defocus) != n_planes:
+        raise ValueError(
+            f"plane_defocus has {len(plane_defocus)} values for {n_planes} planes"
+        )
+    if search_templates.n_orientations != 12 * nside**2:
+        raise ValueError("search_templates must hold the searched HEALPix grid")
+    sampler = _Sampler(torch.Generator().manual_seed(int(seed)))
+    mean = estimate_mean_template(
+        project,
+        weighting,
+        _batches(sampler.rotations(n_mean_samples), max(1, 16 // n_planes)),
+    )
+    offsets = torch.as_tensor(np.asarray(orientation_offsets, np.float64))
+    zero_offset = int(torch.argmin(offsets.abs().sum(dim=1)))
+    df = np.asarray(defocus_offsets, float).reshape(-1)
+    zero_df = int(np.argmin(np.abs(df)))
+    if float(offsets[zero_offset].abs().sum()) > 1e-6 or abs(df[zero_df]) > 1e-6:
+        raise ValueError("the refinement's offsets must include zero")
+    offset_rot = roma.euler_to_rotmat("ZYZ", offsets, degrees=True).float()
+    n_offsets = int(offsets.shape[0])
+    box_filters: dict[int, torch.Tensor] = {}
+
+    def window_filters(plane: int) -> torch.Tensor:
+        """Whitening x CTF on the template box, per defocus offset of ``plane``."""
+        if plane not in box_filters:
+            ctf = refine_ctf(plane_defocus[plane] + df).to(device, torch.float32)
+            box_filters[plane] = ctf * signal_filter.to(device, torch.float32)[None]
+        return box_filters[plane]
+
+    generator = np.random.default_rng(int(seed))
+    k = int(n_candidates)
+    grid = [
+        (
+            int(generator.integers(search_templates.n_orientations)),
+            int(generator.integers(n_psi)),
+            (i * n_planes) // k,
+        )
+        for i in range(k)
+    ]
+    step = 360.0 / n_psi
+
+    def search_scores(orientation: int, psi_index: int, plane: int) -> torch.Tensor:
+        """The search's own templates: the candidate, then its grid neighbours."""
+        o_n, j_n = _neighbours(
+            nside, n_psi, orientation, psi_index, neighbour_rings, neighbour_psi_steps
+        )
+        o = torch.cat([torch.tensor([orientation]), o_n])
+        j = torch.cat([torch.tensor([psi_index]), j_n])
+        m = search_templates(o, j.double() * step)
+        q = project.project_templates(m)  # (D, n, ...)
+        adjacent = [p for p in (plane - 1, plane + 1) if 0 <= p < n_planes]
+        return torch.cat([q[plane], q[adjacent, 0]])  # own, neighbours, planes
+
+    # the search's field SD: the exact one, scaled by its templates' captured power
+    captured, exact_power = 0.0, 0.0
+    for orientation, psi_index, plane in grid:
+        own = search_scores(orientation, psi_index, plane)
+        rot = search_templates.rotations(
+            torch.tensor([orientation]), torch.tensor([psi_index * step])
+        )
+        exact = project(rot)[plane, 0]
+        captured += float(weighting.inner(own[0], own[0]))
+        exact_power += float(weighting.inner(exact, exact))
+    sigma = math.sqrt(mean.sigma2 * captured / exact_power)
+    mean_scaled = mean.mean / sigma
+
+    def windows() -> Iterator[RefinementWindow]:
+        for orientation, psi_index, plane in grid:
+            scores = (search_scores(orientation, psi_index, plane) - mean.mean) / sigma
+            r0 = search_templates.rotations(
+                torch.tensor([orientation]), torch.tensor([psi_index * step])
+            )[0]
+            rotations = offset_rot @ r0  # offset @ R, as refine_template composes
+            window = torch.cat(
+                [
+                    project.box_filtered(
+                        rotations[j : j + batch_size], window_filters(plane)
+                    )
+                    for j in range(0, n_offsets, batch_size)
+                ],
+                dim=1,
+            )  # (n_df, n_offsets, ...): index df * n_offsets + offset
+            window = window.reshape(-1, *window.shape[2:])
+            norm = torch.sqrt(weighting.inner(window, window))
+            window = window / norm[:, None, None] - mean_scaled
+            yield RefinementWindow(
+                window=window,
+                centre=zero_df * n_offsets + zero_offset,
+                search=scores[1:],
+                own=scores[0],
+            )
+
+    gain = sample_refinement_gain(
+        windows(),
+        weighting,
+        None,
+        shift_radius=shift_radius,
+        condition_radius=condition_radius,
+        heights=heights,
+        n_draws=n_draws,
+        seed=seed,
+    )
+    record: dict[str, Any] = {
+        "engine": "panther_em.search + leopard_em.refine_template",
+        "nside": int(nside),
+        "n_psi": int(n_psi),
+        "planes": n_planes,
+        "normalization": "before_ctf" if reference is None else "after_ctf",
+        "orientation_offsets": n_offsets,
+        "defocus_offsets": df.tolist(),
+        "shift_radius": int(shift_radius),
+        "condition_radius": int(condition_radius),
+        "neighbour_rings": int(neighbour_rings),
+        "neighbour_psi_steps": int(neighbour_psi_steps),
+        "n_candidates": k,
+        "captured_power": captured / exact_power,
+        "n_mean_samples": int(n_mean_samples),
+        "seed": int(seed),
+        "device": str(device),
+    }
+    record.update(details or {})
+    record["seconds"] = time.time() - start
+    return predict_refined_null_rate(search, gain, candidate_threshold, details=record)

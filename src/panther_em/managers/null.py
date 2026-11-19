@@ -52,11 +52,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import h5py
 import numpy as np
 import torch
+from leopard_em.analysis.analytic_null import refine_window
 from leopard_em.analysis.empirical_null import NullPeaks, distinct_peaks, valid_region
 from leopard_em.utils.phase_randomization import phase_randomize_image
 from pydantic import Field, model_validator
 from scipy.special import ndtri
 
+from panther_em.filters import ctf_planes
 from panther_em.managers._common import (
     Model,
     ProgramConfig,
@@ -78,10 +80,19 @@ from panther_em.managers.search import (
 )
 from panther_em.search import PixelLabel, SearchImages
 from panther_em.search.images import SearchGeometry
-from panther_em.search.null_model import healpix_nside, predict_null, reference_grid
+from panther_em.search.null_model import (
+    SearchTemplates,
+    healpix_nside,
+    predict_null,
+    predict_refined_null,
+    reference_grid,
+)
 
 if TYPE_CHECKING:
-    from leopard_em.analysis.analytic_null import AnalyticNullPrediction
+    from leopard_em.analysis.analytic_null import (
+        AnalyticNullPrediction,
+        RefinedNullPrediction,
+    )
 
     from panther_em.search import Micrograph, SearchResult
 
@@ -98,6 +109,45 @@ class AnalyticSpec(Model):
     batch_size: int = Field(default=4, ge=1)
     seed: int = 0
     device: str | None = None  # default: the search's device
+
+
+class RefineSpec(Model):
+    """The refinement of the search's candidates the analytic refined null models.
+
+    Parameters
+    ----------
+    config : Path
+        The Leopard-EM refine_template YAML the candidates are refined with; only its
+        orientation, defocus and pixel size refinement settings are read
+        (:func:`leopard_em.analysis.analytic_null.refine_window`).
+    candidate_threshold : float
+        Panther z-score at or above which candidates are refined (exported).
+    n_candidates : int
+        Rotations sampled as null candidates. Default 8.
+    n_draws : int
+        Gaussian draws per candidate. Default 200,000.
+    shift_radius : int
+        Positions refinement scores about each candidate, +-pixels. Default 1.
+    condition_radius : int
+        Positions at which the candidate beat its grid neighbours (it is a distinct
+        peak), +-pixels. Default 2.
+    neighbour_rings, neighbour_psi_steps : int
+        The grid neighbourhood the candidate beat: HEALPix rings around its view and
+        in-plane steps around its angle. Default 1 and 1.
+    defocus_step : float, optional
+        Defocus step of the modelled window, A, when coarser than the refine's own.
+        Default 40; ``None``: the refine's own step.
+    """
+
+    config: Path
+    candidate_threshold: float
+    n_candidates: int = Field(default=8, ge=1)
+    n_draws: int = Field(default=200_000, ge=1000)
+    shift_radius: int = Field(default=1, ge=0)
+    condition_radius: int = Field(default=2, ge=0)
+    neighbour_rings: int = Field(default=1, ge=0)
+    neighbour_psi_steps: int = Field(default=1, ge=0)
+    defocus_step: float | None = Field(default=40.0, gt=0.0)
 
 
 class NullConfig(ProgramConfig):
@@ -144,6 +194,9 @@ class NullConfig(ProgramConfig):
         records.
     analytic : AnalyticSpec
         Sampling of the analytic prediction.
+    refine : RefineSpec, optional
+        With the analytic mode, also predict the null after the candidates are
+        refined (a threshold on refined z-scores).
     device : str, optional
         Compute device; default the search's.
     overwrite : bool
@@ -168,6 +221,7 @@ class NullConfig(ProgramConfig):
     keep_results: bool = False
     volume: Path | None = None
     analytic: AnalyticSpec = AnalyticSpec()
+    refine: RefineSpec | None = None
     device: str | None = None
     overwrite: bool = False
 
@@ -183,6 +237,8 @@ class NullConfig(ProgramConfig):
             self.micrographs
         ):
             raise ValueError("micrographs must be unique")
+        if self.refine is not None and not self.predicted:
+            raise ValueError("refine needs mode 'analytic' or 'both'")
         return self
 
     @property
@@ -382,6 +438,7 @@ def _cuts(
     area: float,
     hypotheses: int,
     gate: float | None,
+    refined: RefinedNullPrediction | None = None,
 ) -> list[dict[str, Any]]:
     out = []
     for fp in config.false_positives:
@@ -405,6 +462,9 @@ def _cuts(
         if prediction is not None:
             predicted = prediction.zscore_cutoff(fp)
             cut["analytic"] = predicted if math.isfinite(predicted) else None
+        if refined is not None:
+            value = refined.zscore_cutoff(fp)
+            cut["analytic_refined"] = value if math.isfinite(value) else None
         out.append(cut)
     return out
 
@@ -447,13 +507,10 @@ def _valid_area(state: _Run, micrograph: Micrograph, border: int) -> int:
     return int(valid_region(shape, border, exclude).sum())
 
 
-def _predict(
-    config: NullConfig,
-    state: _Run,
-    micrograph: Micrograph,
-    area: int,
-    volume: np.ndarray,
-) -> AnalyticNullPrediction:
+def _model_inputs(
+    config: NullConfig, state: _Run, micrograph: Micrograph
+) -> dict[str, Any]:
+    """The analytic model's inputs from the search (for the two predictions)."""
     final: StageSpec = state.config.stages[-1]
     if final.orientations is not None:
         raise NotImplementedError(
@@ -472,29 +529,109 @@ def _predict(
         else reference_grid(*state.reference_noise, box, device=device)
     )
     report = state.normalization_reports.get(micrograph.name)
-    return predict_null(
-        micrograph,
-        volume,
-        state.whitening.template_filter(box),
-        nside=nside,
-        n_psi=final.n_psi,
-        valid_area=area,
-        planes=final.planes,
-        n_filters=state.template.space.n_filters,
-        support=state.template.reconstructor.support,
-        normalize_projections=bool(result.normalized_projections),
-        reference=reference,
-        mask_radius=config.peak_radius,
-        n_mean_samples=spec.n_mean_samples,
-        n_kappa_pairs=spec.n_kappa_pairs,
-        n_lattice_samples=spec.n_lattice_samples,
-        batch_size=spec.batch_size,
-        seed=spec.seed,
-        device=device,
-        details={
+    return {
+        "template_filter": state.whitening.template_filter(box),
+        "nside": nside,
+        "n_psi": final.n_psi,
+        "planes": final.planes,
+        "n_filters": state.template.space.n_filters,
+        "support": state.template.reconstructor.support,
+        "normalize_projections": bool(result.normalized_projections),
+        "reference": reference,
+        "n_mean_samples": spec.n_mean_samples,
+        "seed": spec.seed,
+        "device": device,
+        "details": {
             "micrograph": micrograph.name,
             "plane_scale": None if report is None else report["plane_scale"],
         },
+    }
+
+
+def _predict(
+    config: NullConfig,
+    state: _Run,
+    micrograph: Micrograph,
+    area: int,
+    volume: np.ndarray,
+) -> AnalyticNullPrediction:
+    inputs = _model_inputs(config, state, micrograph)
+    template_filter = inputs.pop("template_filter")
+    spec = config.analytic
+    return predict_null(
+        micrograph,
+        volume,
+        template_filter,
+        valid_area=area,
+        mask_radius=config.peak_radius,
+        n_kappa_pairs=spec.n_kappa_pairs,
+        n_lattice_samples=spec.n_lattice_samples,
+        batch_size=spec.batch_size,
+        **inputs,
+    )
+
+
+def _predict_refined(
+    config: NullConfig,
+    state: _Run,
+    entry: MicrographEntry,
+    micrograph: Micrograph,
+    volume: np.ndarray,
+    search: AnalyticNullPrediction,
+) -> RefinedNullPrediction:
+    refine = config.refine
+    assert refine is not None
+    inputs = _model_inputs(config, state, micrograph)
+    template_filter = inputs.pop("template_filter")
+    offsets, defocus = refine_window(refine.config, refine.defocus_step)
+    search_config = state.config
+    optics = search_config.optics
+    mean = (entry.defocus_u + entry.defocus_v) / 2
+    planes = inputs["planes"]
+    offsets_all = [float(o) for o in search_config.defocus_offsets]
+    plane_defocus = offsets_all if planes is None else [offsets_all[i] for i in planes]
+
+    box = state.template.template_shape
+
+    def refine_ctf(relative: np.ndarray) -> torch.Tensor:
+        # on the template box, as refine_template's calculate_ctf_filter_stack
+        return ctf_planes(
+            box,
+            [mean + float(o) for o in relative],
+            pixel_size=optics.pixel_size,
+            astigmatism=(entry.defocus_u - entry.defocus_v) / 2,
+            astigmatism_angle=entry.astigmatism_angle,
+            voltage=optics.voltage,
+            spherical_aberration=optics.spherical_aberration,
+            amplitude_contrast=optics.amplitude_contrast_ratio,
+            phase_shift=optics.phase_shift,
+            device=inputs["device"],
+        )
+
+    final: StageSpec = state.config.stages[-1]
+    templates = SearchTemplates(
+        state.template.reconstructor,
+        [tuple(int(v) for v in r) for r in final.rectangles],
+    )
+    return predict_refined_null(
+        micrograph,
+        volume,
+        template_filter,
+        state.whitening.average_filter(box, inputs["device"]),
+        search,
+        templates,
+        orientation_offsets=offsets,
+        defocus_offsets=defocus,
+        candidate_threshold=refine.candidate_threshold,
+        refine_ctf=refine_ctf,
+        plane_defocus=plane_defocus,
+        shift_radius=refine.shift_radius,
+        condition_radius=refine.condition_radius,
+        neighbour_rings=refine.neighbour_rings,
+        neighbour_psi_steps=refine.neighbour_psi_steps,
+        n_candidates=refine.n_candidates,
+        n_draws=refine.n_draws,
+        **inputs,
     )
 
 
@@ -613,8 +750,13 @@ def run(config: NullConfig) -> dict[str, Any]:
             area = _valid_area(state, source, config.border)
             hypotheses = _hypotheses(state)
             prediction = None
+            refined = None
             if volume is not None:
                 prediction = _predict(config, state, source, area, volume)
+                if config.refine is not None:
+                    refined = _predict_refined(
+                        config, state, entry, source, volume, prediction
+                    )
             del source
 
             peaks = None
@@ -644,6 +786,7 @@ def run(config: NullConfig) -> dict[str, Any]:
                 peaks=peaks,
                 copies=records.get(name, {}),
                 prediction=prediction,
+                refined=refined,
                 report=report,
             )
     finally:
@@ -665,6 +808,7 @@ def _record(
     copies: dict[int, _Copy],
     prediction: AnalyticNullPrediction | None,
     report: dict[str, Any] | None,
+    refined: RefinedNullPrediction | None = None,
 ) -> dict[str, Any]:
     """One micrograph's entry of ``null_summary.json``."""
     record: dict[str, Any] = {
@@ -673,7 +817,9 @@ def _record(
         "valid_area": area,
         "hypotheses": hypotheses,
         "peak_floor": floor,
-        "cuts": _cuts(config, peaks, prediction, area, hypotheses, gate["floor"]),
+        "cuts": _cuts(
+            config, peaks, prediction, area, hypotheses, gate["floor"], refined
+        ),
     }
     if report is not None:
         record["normalization"] = report
@@ -691,4 +837,6 @@ def _record(
         record["rate"] = _rate_table(peaks, config.rate_step)
     if prediction is not None:
         record["analytic"] = prediction.as_dict()
+    if refined is not None:
+        record["analytic_refined"] = refined.as_dict()
     return record

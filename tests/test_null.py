@@ -236,6 +236,68 @@ def test_predicted_null_matches_measured_nulls(pipeline, tmp_path):
     assert bool(np.all(np.diff(rate) <= 1e-12))
 
 
+def test_predicted_refined_null(pipeline, tmp_path):
+    """With a refine_template config, the analytic mode also predicts the threshold
+    on refined z-scores, from the search's own templates and refinement's exact ones."""
+    _, out = pipeline
+    path = low_defocus(out, tmp_path / "low.yaml")
+    refine = tmp_path / "refine.yaml"
+    refine.write_text(
+        yaml.safe_dump(
+            {
+                "orientation_refinement_config": {
+                    "enabled": True,
+                    "psi_step_coarse": 10.0,
+                    "psi_step_fine": 5.0,
+                    "theta_step_coarse": 10.0,
+                    "theta_step_fine": 5.0,
+                },
+                "defocus_refinement_config": {
+                    "enabled": True,
+                    "defocus_min": -200.0,
+                    "defocus_max": 200.0,
+                    "defocus_step": 200.0,
+                },
+            }
+        )
+    )
+    summary = null.run(
+        null.NullConfig(
+            search=path,
+            output_dir=tmp_path / "nulls",
+            mode="analytic",
+            micrographs=["m1"],
+            false_positives=[1.0],
+            analytic=null.AnalyticSpec(
+                n_mean_samples=200, n_kappa_pairs=8, n_lattice_samples=16
+            ),
+            refine=null.RefineSpec(
+                config=refine, candidate_threshold=3.0, n_candidates=2, n_draws=4000
+            ),
+        )
+    )
+    record = summary["micrographs"]["m1"]
+    cut = record["cuts"][0]
+    # Leopard-EM re-scores exactly what the search approximated: the refined cut may
+    # fall below the search's (here it does, on a coarse decomposition)
+    assert np.isfinite(cut["analytic_refined"]) and np.isfinite(cut["analytic"])
+    refined = record["analytic_refined"]
+    assert 0.5 < refined["details"]["captured_power"] < 1.5
+    assert bool(np.all(np.diff(np.asarray(refined["rate"])) <= 1e-9))
+    assert refined["candidate_threshold"] == 3.0
+    assert refined["gain"]["n_windows"] == 2
+    assert refined["details"]["defocus_offsets"] == [-200.0, 0.0, 200.0]
+    assert refined["details"]["normalization"] == "after_ctf"
+    survival = np.asarray(refined["gain"]["survival"])
+    assert bool(np.all(np.diff(survival, axis=1) <= 1e-12))
+    with pytest.raises(ValueError, match="refine needs mode"):
+        null.NullConfig(
+            search=path,
+            output_dir=tmp_path / "x",
+            refine=null.RefineSpec(config=refine, candidate_threshold=3.0),
+        )
+
+
 # --------------------------------------------------------------------------- #
 # The program
 # --------------------------------------------------------------------------- #

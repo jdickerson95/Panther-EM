@@ -128,6 +128,62 @@ Micrograph `i` of the search config uses seeds `seed + i * seed_stride` (default
 1000), so every micrograph gets its own copies. Set the search's final threshold to the cut
 (`decision.threshold: 7.73`), or pick from the search results' z maps above it.
 
+### Thresholds on refined z (`refine`)
+
+Candidates exported to Leopard-EM and refined by its refine_template get a refined z, and
+their threshold has to come from the refined null. With `mode: analytic` (or `both`), a
+`refine` block predicts it, through Leopard-EM's engine-agnostic refined null
+(`leopard_em.analysis.analytic_null.refine`):
+
+```yaml
+refine:
+  config: refine_template.yaml   # the Leopard-EM refine config the candidates get
+  candidate_threshold: 6.8       # Panther z at or above which candidates are exported
+  # n_candidates: 8   n_draws: 200000   shift_radius: 1   condition_radius: 2
+  # defocus_step: 40.0           # modelled defocus step, A (the refine's own if coarser)
+```
+
+`null_summary.json` then holds `analytic_refined` per target in `cuts`, and the prediction
+(rate, the gain distribution by candidate height) per micrograph.
+
+The model conditions each sampled null candidate on what the search established about it.
+It scored u, on the search's own templates (`SearchTemplates`: the decomposition's
+reconstructions, with the rank truncation and the polar warp), and it beat its grid
+neighbours. Then it draws refinement's exact scores over its window: Leopard-EM's offsets
+composed `offset @ R`, its defocus range, ±1 px, under the whitening alone and the CTF, both
+applied in the template box as refine_template applies them, at unit variance
+as refine_template normalises them. Refinement re-scores exactly what the search
+approximated, so a null candidate can lose z.
+
+That comparison needs the export's scale right: each pixel's correlations are divided by
+the median sigma of the pixels its own last stage scored (`correlation_scales`). Before, one
+median over every pixel (stage 1's, in a two-stage search) left the particles at
+sigma / c ~ 1.1, and refined z came out ~9% low.
+
+**Validation** (xenon_131 production search, before-CTF, candidates at z >= 6.8 refined by
+Leopard-EM's light refine: 77 orientation offsets, ±100 Å at 20 Å; 20 phase-randomised
+nulls; refined z recomputed for the per-stage scale from the stored refine output):
+
+| Panther z (median) | Gain p10 / p50 / p90 / p99, measured | Predicted (±1 px, 8 candidates) |
+|---|---|---|
+| 6.88 | −0.40 / −0.10 / +0.24 / +0.55 | −0.40 / −0.11 / +0.24 / +0.56 |
+| 7.09 | −0.44 / −0.13 / +0.21 / +0.50 | −0.42 / −0.14 / +0.22 / +0.54 |
+| 7.34 | −0.48 / −0.19 / +0.16 / +0.51 | −0.44 / −0.16 / +0.19 / +0.51 |
+
+* **Refined 1-FP threshold:** 7.96 predicted (the predicted refined / search ratio on the
+  measured search null) against 7.92 measured; 8.02 fully predicted (the search's own
+  prediction is +0.03 here, and its area is the whole map).
+* **Same pose:** Leopard-EM's exact score at a null candidate's own pose runs 0.33 z below
+  its Panther z (median), and the model gives 0.31-0.34. Two things make it. The search's
+  SVD templates differ from the exact ones (their score correlation is 0.87 at a fixed
+  position, measured and predicted alike). And before-CTF normalisation leaves the planes
+  with unequal noise variance, which the pooled per-pixel sigma does not remove. Null peaks
+  favour the noisier planes (four times as many at ±1200 Å as mid-range), and the model
+  pools its sampled candidates by that density.
+* **Window:** ±2 px gives the same gains within 0.03 z (cut 8.03 against 8.02) at 2.5x the
+  cost.
+* **Cost:** ~45 s per sampled candidate at ±1 px on one GPU (7,900 scores per window).
+
 ## 4. Cost
 
 * **Measured:** one full search per copy, plus a few seconds of peak finding: 5 to 6 min
@@ -228,6 +284,11 @@ copies, predicted and measured 1- and 3-false-positive cuts agree within 0.15 z.
 * **Self-seeded stages.** The validation runs used a dense stage 1: `seeding` is on
   mdg-seed-local-stage1, not on this branch. Nulls must be run with the same pipeline as the
   data, seeded or not.
+* **Refined null.** Validated on one micrograph, the before-CTF production search and
+  Leopard-EM's light refine. After-CTF and other refines are untested, and the polar grid's
+  half-pixel centre (fixed on another branch) is modelled as the decomposition has it.
+  77 offsets x 11 defocus values at ±2 px is ~21,000 scores per sampled candidate; use a
+  coarser `defocus_step` if memory is short.
 * **Sharing nulls between micrographs** is untested beyond micrographs with nearly the same
   spectrum; per-micrograph nulls (the default) are the safe choice.
 
@@ -236,7 +297,8 @@ copies, predicted and measured 1- and 3-false-positive cuts agree within 0.15 z.
 | file | change |
 |---|---|
 | `src/panther_em/managers/null.py` | new: `NullConfig`, `run`; copies, peaks file, summary, gate floor |
-| `src/panther_em/search/null_model.py` | new: `predict_null`, `TemplateProjector`, `lag_grid_planes`, `lattice_neighbours`, `reference_grid`, `healpix_nside` |
+| `src/panther_em/search/null_model.py` | new: `predict_null`, `predict_refined_null`, `TemplateProjector`, `SearchTemplates`, `lag_grid_planes`, `lattice_neighbours`, `reference_grid`, `healpix_nside` |
+| `src/panther_em/managers/leopard.py` | `correlation_scales`: the export's scale per stage |
 | `src/panther_em/managers/_common.py` | `read_image`, `centered` (split out of `read_micrograph`, unchanged behaviour) |
 | `src/panther_em/managers/search.py` | `_Run.reference_noise`: the after-CTF reference noise kept for the predictor |
 | `src/panther_em/cli.py`, `managers/__init__.py` | the `null` program |
