@@ -339,6 +339,8 @@ class _Run:
         self.offsets = torch.tensor(config.defocus_offsets, dtype=torch.float32)
         self.searchers: dict[tuple[int, int], Searcher] = {}
         self.normalization: AfterCtfNormalization | None = None
+        # (frequencies, (D, F) reference noise) the row factors were computed under
+        self.reference_noise: tuple[torch.Tensor, torch.Tensor] | None = None
         self.normalization_reports: dict[str, dict] = {}
         self.fdr_reports: dict[str, dict] = {}
         if config.normalization == "after_ctf":
@@ -386,6 +388,7 @@ class _Run:
             device=self.device,
         )
         self.normalization = AfterCtfNormalization.create(table, reference)
+        self.reference_noise = (table.frequencies, reference)
         a = self.normalization.row_scale
         self.template.scale_rows(a)
         self.tables = {tag: scale_table(t, a) for tag, t in self.tables.items()}
