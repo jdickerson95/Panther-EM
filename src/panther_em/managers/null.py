@@ -59,6 +59,7 @@ from pydantic import Field, model_validator
 from scipy.special import ndtri
 
 from panther_em.filters import ctf_planes
+from panther_em.managers._analytic import AnalyticSpec
 from panther_em.managers._common import (
     Model,
     ProgramConfig,
@@ -98,17 +99,6 @@ if TYPE_CHECKING:
 
 PEAKS_FORMAT = "null_peaks"
 DEFAULT_FLOOR_OFFSET = 1.5  # default peak floor: the final threshold minus this
-
-
-class AnalyticSpec(Model):
-    """Sampling of the analytic prediction (:func:`~.null_model.predict_null`)."""
-
-    n_mean_samples: int = Field(default=3000, ge=2)
-    n_kappa_pairs: int = Field(default=256, ge=2)
-    n_lattice_samples: int = Field(default=128, ge=1)
-    batch_size: int = Field(default=4, ge=1)
-    seed: int = 0
-    device: str | None = None  # default: the search's device
 
 
 class RefineSpec(Model):
@@ -484,15 +474,7 @@ def _rate_table(peaks: NullPeaks, step: float) -> dict[str, Any]:
 
 
 def _volume_path(config: NullConfig, search_config: SearchConfig) -> Path:
-    if config.volume is not None:
-        return config.volume
-    recorded = read_config(search_config.decomposition, DecomposeConfig)
-    if recorded is None:
-        raise ValueError(
-            f"'{search_config.decomposition}' records no decompose config; give the "
-            "template volume as `volume`"
-        )
-    return recorded.volume
+    return search_volume(search_config, config.volume)
 
 
 def _valid_area(state: _Run, micrograph: Micrograph, border: int) -> int:
@@ -508,7 +490,7 @@ def _valid_area(state: _Run, micrograph: Micrograph, border: int) -> int:
 
 
 def _model_inputs(
-    config: NullConfig, state: _Run, micrograph: Micrograph
+    spec: AnalyticSpec, state: _Run, micrograph: Micrograph
 ) -> dict[str, Any]:
     """The analytic model's inputs from the search (for the two predictions)."""
     final: StageSpec = state.config.stages[-1]
@@ -520,7 +502,6 @@ def _model_inputs(
     if result.phi_values is None or result.theta_values is None:
         raise ValueError("the decomposition records no orientations")
     nside = healpix_nside(result.phi_values, result.theta_values)
-    spec = config.analytic
     device = spec.device or state.config.device
     box = state.template.template_shape
     reference = (
@@ -548,6 +529,51 @@ def _model_inputs(
     }
 
 
+def predict_search_null(
+    state: _Run,
+    micrograph: Micrograph,
+    area: int,
+    volume: np.ndarray,
+    *,
+    spec: AnalyticSpec | None = None,
+    mask_radius: float = 10.0,
+) -> AnalyticNullPrediction:
+    """The analytic null of a prepared micrograph under a search run's own settings.
+
+    The search's template, filters, grid, final stage and after-CTF state
+    (:class:`~panther_em.managers.search._Run`), over ``area`` positions; ``volume``
+    is the template volume the decomposition was made from (:func:`search_volume`).
+    The FDR rule (``SearchConfig.fdr_null: analytic``) and :func:`run` use it.
+    """
+    spec = AnalyticSpec() if spec is None else spec
+    inputs = _model_inputs(spec, state, micrograph)
+    template_filter = inputs.pop("template_filter")
+    return predict_null(
+        micrograph,
+        volume,
+        template_filter,
+        valid_area=area,
+        mask_radius=mask_radius,
+        n_kappa_pairs=spec.n_kappa_pairs,
+        n_lattice_samples=spec.n_lattice_samples,
+        batch_size=spec.batch_size,
+        **inputs,
+    )
+
+
+def search_volume(search_config: SearchConfig, volume: Path | None = None) -> Path:
+    """The template volume: ``volume``, else the one the decomposition records."""
+    if volume is not None:
+        return volume
+    recorded = read_config(search_config.decomposition, DecomposeConfig)
+    if recorded is None:
+        raise ValueError(
+            f"'{search_config.decomposition}' records no decompose config; give the "
+            "template volume"
+        )
+    return recorded.volume
+
+
 def _predict(
     config: NullConfig,
     state: _Run,
@@ -555,19 +581,13 @@ def _predict(
     area: int,
     volume: np.ndarray,
 ) -> AnalyticNullPrediction:
-    inputs = _model_inputs(config, state, micrograph)
-    template_filter = inputs.pop("template_filter")
-    spec = config.analytic
-    return predict_null(
+    return predict_search_null(
+        state,
         micrograph,
+        area,
         volume,
-        template_filter,
-        valid_area=area,
+        spec=config.analytic,
         mask_radius=config.peak_radius,
-        n_kappa_pairs=spec.n_kappa_pairs,
-        n_lattice_samples=spec.n_lattice_samples,
-        batch_size=spec.batch_size,
-        **inputs,
     )
 
 
@@ -581,7 +601,7 @@ def _predict_refined(
 ) -> RefinedNullPrediction:
     refine = config.refine
     assert refine is not None
-    inputs = _model_inputs(config, state, micrograph)
+    inputs = _model_inputs(config.analytic, state, micrograph)
     template_filter = inputs.pop("template_filter")
     offsets, defocus = refine_window(refine.config, refine.defocus_step)
     search_config = state.config

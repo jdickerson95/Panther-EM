@@ -194,3 +194,50 @@ def test_fdr_search_with_a_calibrated_null(pipeline, tmp_path):
     result = SearchResult.load(done[name])
     r, c = module.PARTICLE["top_left"]
     assert int(result.label[0, r, c]) == int(PixelLabel.ACCEPTED)
+
+
+def test_fdr_null_analytic_is_computed_by_the_search(pipeline, tmp_path, monkeypatch):
+    """The default ``fdr_null: analytic``: each micrograph's own analytic null, no
+    separate null run; ``formula`` keeps the formula; a search the model cannot cover
+    falls back to the formula and says why."""
+    module, out = pipeline
+    base = SearchConfig.from_yaml(out / "search.yaml")
+    assert base.fdr_null == "analytic"
+    name = module.PARTICLE["micrograph"]
+    one = base.model_copy(
+        update={
+            "micrographs": [m for m in base.micrographs if m.key == name],
+            "output_dir": tmp_path / "analytic",
+        }
+    )
+    search.run(one)
+    rep = json.loads((tmp_path / "analytic" / "search_summary.json").read_text())[name][
+        "fdr"
+    ]
+    assert rep["null"] == "analytic"
+    assert np.isfinite(rep["null_cut_1fp"]) and rep["null_seconds"] > 0
+    if rep["threshold"] is not None:
+        assert rep["expected_false_picks"] < rep["expected_false_picks_formula"]
+
+    search.run(
+        one.model_copy(
+            update={"output_dir": tmp_path / "formula", "fdr_null": "formula"}
+        )
+    )
+    rep = json.loads((tmp_path / "formula" / "search_summary.json").read_text())[name][
+        "fdr"
+    ]
+    assert rep["null"] == "formula"
+    assert rep["expected_false_picks"] == rep["expected_false_picks_formula"]
+
+    from panther_em.managers import null as null_program
+
+    def unavailable(*args, **kwargs):
+        raise NotImplementedError("a final stage over a subset of orientations")
+
+    monkeypatch.setattr(null_program, "predict_search_null", unavailable)
+    search.run(one.model_copy(update={"output_dir": tmp_path / "fallback"}))
+    rep = json.loads((tmp_path / "fallback" / "search_summary.json").read_text())[name][
+        "fdr"
+    ]
+    assert rep["null"] == "formula" and "subset of orientations" in rep["note"]

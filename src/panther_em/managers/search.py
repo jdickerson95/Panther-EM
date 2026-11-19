@@ -24,7 +24,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 from pydantic import Field, model_validator
@@ -33,12 +33,14 @@ from panther_em._precision import Precision
 from panther_em.approximation import PerSpatialFrequencyErrorTable
 from panther_em.filters import WhiteningFilter, ctf_planes
 from panther_em.managers import leopard
+from panther_em.managers._analytic import AnalyticSpec
 from panther_em.managers._common import (
     Model,
     ProgramConfig,
     Rectangle,
     read_mask,
     read_micrograph,
+    read_volume,
     save_output,
 )
 from panther_em.managers.fdr import apply_fdr, calibrated_null_rate
@@ -65,6 +67,9 @@ from panther_em.search.normalization import (
     reference_noise,
     scale_table,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class Optics(Model):
@@ -211,14 +216,24 @@ class SearchConfig(ProgramConfig):
     fdr_peak_radius : float
         Minimum distance between the peaks the FDR rule counts, pixels. Default 10
         (the particle export's ``peak_radius``).
-    fdr_null : Path, optional
-        A ``null_summary.json`` of ``panther-em null`` for this search config: each
-        micrograph's FDR null is then its calibrated null (scaled to its searched
-        positions) instead of the formula's. A micrograph the summary lacks keeps the
-        formula (reported).
+    fdr_null : {"analytic", "formula"} or Path
+        The FDR rule's null. ``"analytic"`` (default): each micrograph's analytic null,
+        computed from the search's own template, filters, grid and the micrograph's
+        power spectrum (``panther_em.managers.null.predict_search_null``; about a
+        minute per 13-plane 4k micrograph on a GPU). ``"formula"``: the
+        independent-trial count (conservative: about half the requested FDR on
+        xenon_131 and Track S). A path: the ``null_summary.json`` of ``panther-em
+        null`` for this search config (``fdr_null_source`` picks its null). A
+        micrograph the analytic model cannot cover (or the summary lacks) keeps the
+        formula, and its record says why.
     fdr_null_source : {"analytic", "empirical"}
-        Which calibrated null: the analytic prediction (default) or the
+        With a ``null_summary.json``: its analytic prediction (default) or the
         phase-randomised copies' rate table.
+    fdr_volume : Path, optional
+        The template volume for ``fdr_null: analytic``; default the one the
+        decomposition records.
+    fdr_analytic : AnalyticSpec
+        Sampling of ``fdr_null: analytic`` (as ``panther-em null``'s ``analytic``).
     """
 
     program: ClassVar[str] = "search"
@@ -246,8 +261,10 @@ class SearchConfig(ProgramConfig):
     fdr_reach: float = Field(default=0.5, ge=0.0)
     fdr_gate_reach: float = Field(default=0.25, ge=0.0)
     fdr_peak_radius: float = Field(default=10.0, gt=0.0)
-    fdr_null: Path | None = None
+    fdr_null: Literal["analytic", "formula"] | Path = "analytic"
     fdr_null_source: Literal["analytic", "empirical"] = "analytic"
+    fdr_volume: Path | None = None
+    fdr_analytic: AnalyticSpec = AnalyticSpec()
 
     @model_validator(mode="after")
     def _links(self) -> SearchConfig:
@@ -343,6 +360,7 @@ class _Run:
         self.reference_noise: tuple[torch.Tensor, torch.Tensor] | None = None
         self.normalization_reports: dict[str, dict] = {}
         self.fdr_reports: dict[str, dict] = {}
+        self._fdr_volume: np.ndarray | None = None
         if config.normalization == "after_ctf":
             self._normalize_after_ctf()
 
@@ -424,24 +442,21 @@ class _Run:
         return t - (self.config.fdr_reach if final else self.config.fdr_gate_reach)
 
     def apply_fdr(
-        self, result: SearchResult, n_pixels: int, name: str = ""
+        self,
+        result: SearchResult,
+        n_pixels: int,
+        name: str = "",
+        micrograph: Micrograph | None = None,
     ) -> tuple[SearchResult, dict]:
         """Keep ACCEPTED only the peaks above the micrograph's BH threshold.
 
-        ``n_pixels`` is the micrograph's searched positions (under its mask); the
-        null is ``name``'s calibrated one with ``fdr_null`` set, else the formula's.
+        ``n_pixels`` is the micrograph's searched positions (under its mask). The
+        null is ``fdr_null``'s: the analytic null of ``micrograph`` (the prepared
+        one), ``name``'s from a null summary, or the formula's.
         """
         final = self.config.stages[-1]
         assert self.config.fdr is not None
-        rate, record = None, None
-        if self.config.fdr_null is not None:
-            found = calibrated_null_rate(
-                self.config.fdr_null, name, n_pixels, self.config.fdr_null_source
-            )
-            if found is None:
-                record = {"null": "formula", "note": f"no calibrated null for {name}"}
-            else:
-                rate, record = found
+        rate, record = self._fdr_null(n_pixels, name, micrograph)
         return apply_fdr(
             result,
             q=self.config.fdr,
@@ -453,6 +468,57 @@ class _Run:
             rate=rate,
             null_record=record,
         )
+
+    def _fdr_null(
+        self, n_pixels: int, name: str, micrograph: Micrograph | None
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """The FDR null's rate and its record (``None`` rate: the formula)."""
+        choice = self.config.fdr_null
+        if choice == "formula":
+            return None, None
+        if choice != "analytic":
+            found = calibrated_null_rate(
+                Path(choice), name, n_pixels, self.config.fdr_null_source
+            )
+            if found is None:
+                return None, {
+                    "null": "formula",
+                    "note": f"no calibrated null for {name}",
+                }
+            return found
+        if micrograph is None:
+            return None, {"null": "formula", "note": "no micrograph to model"}
+        # lazy: the null program imports this module
+        from leopard_em.analysis.fdr import null_rate
+
+        from panther_em.managers.null import predict_search_null, search_volume
+
+        start = time.perf_counter()
+        try:
+            if self._fdr_volume is None:
+                path = search_volume(self.config, self.config.fdr_volume)
+                self._fdr_volume = read_volume(path)
+            prediction = predict_search_null(
+                self,
+                micrograph,
+                n_pixels,
+                self._fdr_volume,
+                spec=self.config.fdr_analytic,
+                mask_radius=self.config.fdr_peak_radius,
+            )
+        except (NotImplementedError, ValueError, FileNotFoundError) as err:
+            return None, {
+                "null": "formula",
+                "note": f"analytic null unavailable: {err}",
+            }
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return null_rate(prediction), {
+            "null": "analytic",
+            "null_cut_1fp": prediction.zscore_cutoff(1.0),
+            "null_seconds": time.perf_counter() - start,
+        }
 
     def n_positions(self, shape: tuple[int, int]) -> int:
         """Search positions of an unmasked micrograph of ``shape``."""
@@ -720,7 +786,7 @@ def run(config: SearchConfig) -> dict[str, Path]:
                 )
                 if state.fdr_active:
                     result, state.fdr_reports[name] = state.apply_fdr(
-                        result, state.n_searchable(micrograph), name
+                        result, state.n_searchable(micrograph), name, micrograph
                     )
                 t3 = time.perf_counter()
                 maps = leopard.match_template_maps(result)  # on the compute device

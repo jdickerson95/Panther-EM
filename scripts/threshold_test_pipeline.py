@@ -249,6 +249,10 @@ def configs(out: Path, device: str, noise_seed: int) -> dict:
             output_dir=out,
             cache_micrographs=True,  # the evaluation reads the prepared micrographs
             device=device,
+            # the FDR rule's analytic null, sampled as the null step's (fast on a CPU)
+            fdr_analytic=null.AnalyticSpec(
+                n_mean_samples=200, n_kappa_pairs=8, n_lattice_samples=16
+            ),
         ),
         "export": export.ExportConfig(
             results=[out / f"{name}_result.h5" for name in NAMES],
