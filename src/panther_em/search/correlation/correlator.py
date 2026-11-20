@@ -313,7 +313,7 @@ class Correlator:
         scale: torch.Tensor | None = None,
     ) -> StageMaps:
         """Score every column of ``store`` over its group's hypotheses only."""
-        forms = self.moment_forms(plan)
+        forms = self.moment_forms(plan, scale)
         maps = StageMaps.empty(store.n_pixels, self.device, plan.hyps.n_evaluated)
         with self._on_compute():
             correlate_local(
