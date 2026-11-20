@@ -52,7 +52,8 @@ static int64_t sentinel_packed_i64() {
  */
 std::vector<torch::Tensor>
 lean_irfft_stats_transposed(torch::Tensor c, int64_t num_psi, int64_t hyp_offset,
-                            std::vector<torch::Tensor> outs) {
+                            std::vector<torch::Tensor> outs,
+                            c10::optional<torch::Tensor> hyp_scale) {
   TORCH_CHECK(c.is_cuda(), "c must be CUDA");
   TORCH_CHECK(c.dim() == 3, "c must be (NumFreq, P, Q) [or (NumFreq, P, 2Q) float16]");
   TORCH_CHECK(c.is_contiguous(),
@@ -109,6 +110,17 @@ lean_irfft_stats_transposed(torch::Tensor c, int64_t num_psi, int64_t hyp_offset
   float *s2_ptr = s2.data_ptr<float>();
   unsigned long long *packed_ptr =
       reinterpret_cast<unsigned long long *>(argmax_packed.data_ptr<int64_t>());
+  const float *scale_ptr = nullptr;
+  if (hyp_scale.has_value() && hyp_scale->defined()) {
+    const torch::Tensor &sc = *hyp_scale;
+    TORCH_CHECK(sc.is_cuda() && sc.device() == c.device(),
+                "hyp_scale must be on c's device");
+    TORCH_CHECK(sc.dtype() == torch::kFloat32 && sc.dim() == 1 && sc.is_contiguous(),
+                "hyp_scale must be a contiguous 1-D float32 tensor");
+    TORCH_CHECK(sc.numel() >= hyp_offset + static_cast<int64_t>(q_total),
+                "hyp_scale must cover hypotheses [0, hyp_offset + Q)");
+    scale_ptr = sc.data_ptr<float>();
+  }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const auto off = static_cast<unsigned int>(hyp_offset);
 
@@ -117,24 +129,24 @@ lean_irfft_stats_transposed(torch::Tensor c, int64_t num_psi, int64_t hyp_offset
     const float2 *ptr =
         reinterpret_cast<const float2 *>(c.data_ptr<c10::complex<float>>());
     if (r == 8)
-      lean::launch_lean_transposed<8, float2>(ptr, s1_ptr, s2_ptr, packed_ptr,
+      lean::launch_lean_transposed<8, float2>(ptr, s1_ptr, s2_ptr, packed_ptr, scale_ptr,
                                               num_freq, p_total, q_total, off, stream);
     else if (r == 4)
-      lean::launch_lean_transposed<4, float2>(ptr, s1_ptr, s2_ptr, packed_ptr,
+      lean::launch_lean_transposed<4, float2>(ptr, s1_ptr, s2_ptr, packed_ptr, scale_ptr,
                                               num_freq, p_total, q_total, off, stream);
     else
-      lean::launch_lean_transposed<2, float2>(ptr, s1_ptr, s2_ptr, packed_ptr,
+      lean::launch_lean_transposed<2, float2>(ptr, s1_ptr, s2_ptr, packed_ptr, scale_ptr,
                                               num_freq, p_total, q_total, off, stream);
   } else {
     const __half2 *ptr = reinterpret_cast<const __half2 *>(c.data_ptr());
     if (r == 8)
-      lean::launch_lean_transposed<8, __half2>(ptr, s1_ptr, s2_ptr, packed_ptr,
+      lean::launch_lean_transposed<8, __half2>(ptr, s1_ptr, s2_ptr, packed_ptr, scale_ptr,
                                                num_freq, p_total, q_total, off, stream);
     else if (r == 4)
-      lean::launch_lean_transposed<4, __half2>(ptr, s1_ptr, s2_ptr, packed_ptr,
+      lean::launch_lean_transposed<4, __half2>(ptr, s1_ptr, s2_ptr, packed_ptr, scale_ptr,
                                                num_freq, p_total, q_total, off, stream);
     else
-      lean::launch_lean_transposed<2, __half2>(ptr, s1_ptr, s2_ptr, packed_ptr,
+      lean::launch_lean_transposed<2, __half2>(ptr, s1_ptr, s2_ptr, packed_ptr, scale_ptr,
                                                num_freq, p_total, q_total, off, stream);
   }
   auto launch_err = cudaGetLastError();
@@ -181,9 +193,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lean_irfft_stats_transposed", &lean_irfft_stats_transposed,
         "Register-resident kernel for (NumFreq, P, Q) complex64/complex32/"
         "float16-pairs input, num_psi in {128, 256, 512}; optionally accumulates into "
-        "caller-owned [corr_sum, corr_sum2, best_packed] with a global hyp_offset",
+        "caller-owned [corr_sum, corr_sum2, best_packed] with a global hyp_offset; "
+        "an optional float32 hyp_scale (indexed by global hypothesis id) multiplies "
+        "each hypothesis's correlogram",
         pybind11::arg("c"), pybind11::arg("num_psi"), pybind11::arg("hyp_offset") = 0,
-        pybind11::arg("outs") = std::vector<torch::Tensor>{});
+        pybind11::arg("outs") = std::vector<torch::Tensor>{},
+        pybind11::arg("hyp_scale") = c10::optional<torch::Tensor>{});
   m.def("lean_debug_ifft", &lean_debug_ifft,
         "Test entry: unnormalized inverse DFT (N=64, 128 or 256) of complex64 (B, N) rows via "
         "the generated register-resident transforms",

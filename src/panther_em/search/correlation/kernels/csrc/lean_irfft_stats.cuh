@@ -198,6 +198,7 @@ template <unsigned FMAX, unsigned R, typename InT>
 __global__ void __launch_bounds__(128, min_blocks_per_sm(FMAX, R))
 lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
                             float* __restrict__ s2, unsigned long long* __restrict__ argmax_packed,
+                            const float* __restrict__ hyp_scale,
                             unsigned F, unsigned P, unsigned Q, unsigned q_tiles,
                             unsigned hyp_offset) {
   static_assert(R == 2 || R == 4 || R == 8, "R in {2,4,8}");
@@ -261,6 +262,15 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
     if (wr[j] > best) { best = wr[j]; bidx = R * j + h; }
     if (wi[j] > best) { best = wi[j]; bidx = R * j + h + T; }
   }
+  // ---- 6b. per-hypothesis scale s > 0 (after-CTF noise normalization): the
+  //   correlogram is linear in C, so max(s corr) = s max(corr), and the moment sums
+  //   scale by s and s^2. hyp_scale is indexed by the global hypothesis id. ----
+  if (hyp_scale != nullptr) {
+    const float sc = active ? hyp_scale[hyp_offset + q] : 1.f;
+    best *= sc;
+    dc *= sc;
+    pw *= sc * sc;
+  }
   if (!active) best = -FLT_MAX;
   // Flat (hypothesis, psi) index, global across hypothesis batches via hyp_offset so the
   // packed (value, index) max can accumulate over a whole stage without a decode step.
@@ -297,32 +307,33 @@ lean_irfft_stats_transposed(const InT* __restrict__ c, float* __restrict__ s1,
 // ---------------------------------------------------------------------------
 template <unsigned FMAX, unsigned R, typename InT>
 inline void launch_lean_transposed_fmax(const InT* c, float* s1, float* s2, unsigned long long* pk,
-                                        unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
-                                        cudaStream_t stream) {
+                                        const float* hyp_scale, unsigned F, unsigned P, unsigned Q,
+                                        unsigned hyp_offset, cudaStream_t stream) {
   constexpr unsigned PAIRS = 128 / (R / 2);
   const unsigned q_tiles = (Q + PAIRS - 1) / PAIRS;
   lean_irfft_stats_transposed<FMAX, R, InT><<<P * q_tiles, 128, 0, stream>>>(
-      c, s1, s2, pk, F, P, Q, q_tiles, hyp_offset);
+      c, s1, s2, pk, hyp_scale, F, P, Q, q_tiles, hyp_offset);
 }
 
 template <unsigned FMAX, unsigned R, typename InT>
 inline void launch_lean_by_fmax(const InT* c, float* s1, float* s2, unsigned long long* pk,
-                                unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
-                                cudaStream_t stream) {
+                                const float* hyp_scale, unsigned F, unsigned P, unsigned Q,
+                                unsigned hyp_offset, cudaStream_t stream) {
   if constexpr (FMAX > 8) {
     if (F <= FMAX - 8)
-      return launch_lean_by_fmax<FMAX - 8, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream);
+      return launch_lean_by_fmax<FMAX - 8, R, InT>(c, s1, s2, pk, hyp_scale, F, P, Q, hyp_offset,
+                                                   stream);
   }
-  launch_lean_transposed_fmax<FMAX, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream);
+  launch_lean_transposed_fmax<FMAX, R, InT>(c, s1, s2, pk, hyp_scale, F, P, Q, hyp_offset, stream);
 }
 
 // F in [1, 32R + 1] (i.e. NumFreq <= n_psi/2 + 1).
 template <unsigned R, typename InT>
 inline void launch_lean_transposed(const InT* c, float* s1, float* s2, unsigned long long* pk,
-                                   unsigned F, unsigned P, unsigned Q, unsigned hyp_offset,
-                                   cudaStream_t stream) {
+                                   const float* hyp_scale, unsigned F, unsigned P, unsigned Q,
+                                   unsigned hyp_offset, cudaStream_t stream) {
   constexpr unsigned FTOP = ((32 * R + 1) + 7) / 8 * 8;  // ceil8(NPSI/2 + 1): 72 (R=2), 136 (R=4), 264 (R=8)
-  launch_lean_by_fmax<FTOP, R, InT>(c, s1, s2, pk, F, P, Q, hyp_offset, stream);
+  launch_lean_by_fmax<FTOP, R, InT>(c, s1, s2, pk, hyp_scale, F, P, Q, hyp_offset, stream);
 }
 
 // ---------------------------------------------------------------------------
