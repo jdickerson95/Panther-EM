@@ -185,13 +185,24 @@ class BlockStats(ABC):
         ``(n_sub * gemm_pixels,)`` float32 first and second moment sums.
     n_evaluated : int
         ``(hypothesis, psi)`` pairs every pixel of the block has seen.
+    hyp_scale : torch.Tensor or None
+        ``(n_virtual,)`` float32 factor of every hypothesis's correlogram, by virtual
+        id (after-CTF noise normalization; ones when unset). Allocated when
+        ``n_virtual`` is given and written in place by :meth:`set_scale`, so a
+        captured loop keeps reading the current factors.
     """
 
     #: Whether the reduction runs on the fused kernel (and the loop may be graphed).
     fused: bool = False
 
     def __init__(
-        self, *, n_sub: int, gemm_pixels: int, n_psi: int, device: torch.device
+        self,
+        *,
+        n_sub: int,
+        gemm_pixels: int,
+        n_psi: int,
+        device: torch.device,
+        n_virtual: int | None = None,
     ) -> None:
         self.n_sub = int(n_sub)
         self.gemm_pixels = int(gemm_pixels)
@@ -201,6 +212,34 @@ class BlockStats(ABC):
         self.corr_sum = torch.zeros(n, device=self.device, dtype=torch.float32)
         self.corr_sum2 = torch.zeros(n, device=self.device, dtype=torch.float32)
         self.n_evaluated = 0
+        self.hyp_scale: torch.Tensor | None = (
+            None
+            if n_virtual is None
+            else torch.ones(int(n_virtual), device=self.device, dtype=torch.float32)
+        )
+        self.scaled = False
+
+    @torch.no_grad()
+    def set_scale(self, scale: torch.Tensor | None) -> None:
+        """Set every hypothesis's factor by virtual id (``None``: all ones).
+
+        Written in place into :attr:`hyp_scale` (on the caller's stream), so a loop
+        captured as a CUDA graph reads the factors of the current image set.
+        """
+        if scale is None:
+            if self.hyp_scale is not None and self.scaled:
+                self.hyp_scale.fill_(1.0)
+            self.scaled = False
+            return
+        if self.hyp_scale is None:
+            raise ValueError("these block statistics were built without n_virtual")
+        if tuple(scale.shape) != tuple(self.hyp_scale.shape):
+            raise ValueError(
+                f"scale must have shape {tuple(self.hyp_scale.shape)}, got "
+                f"{tuple(scale.shape)}"
+            )
+        self.hyp_scale.copy_(scale)
+        self.scaled = True
 
     def rows(self, sub: int) -> slice:
         """The block rows of GEMM sub-batch ``sub``."""
@@ -269,10 +308,20 @@ class TorchBlockStats(BlockStats):
     """The reference reduction: ``irfft``, Parseval moments and argmax per batch."""
 
     def __init__(
-        self, *, n_sub: int, gemm_pixels: int, n_psi: int, device: torch.device
+        self,
+        *,
+        n_sub: int,
+        gemm_pixels: int,
+        n_psi: int,
+        device: torch.device,
+        n_virtual: int | None = None,
     ) -> None:
         super().__init__(
-            n_sub=n_sub, gemm_pixels=gemm_pixels, n_psi=n_psi, device=device
+            n_sub=n_sub,
+            gemm_pixels=gemm_pixels,
+            n_psi=n_psi,
+            device=device,
+            n_virtual=n_virtual,
         )
         n = self.n_sub * self.gemm_pixels
         self.best_corr = torch.full((n,), float("-inf"), device=self.device)
@@ -288,7 +337,13 @@ class TorchBlockStats(BlockStats):
 
     def _consume(self, spectrum: Spectrum, batch: HypBatch, rows: slice) -> None:
         n_psi = self.n_psi
-        s1, s2, vmax, amax = reduce_spectrum(spectrum.pnf(), n_psi)
+        pnf = spectrum.pnf()
+        if self.scaled:
+            assert self.hyp_scale is not None
+            first = batch.virtual_offset
+            factor = self.hyp_scale[first : first + batch.size]
+            pnf = pnf.to(torch.complex64) * factor[None, :, None]
+        s1, s2, vmax, amax = reduce_spectrum(pnf, n_psi)
         self.corr_sum[rows] += s1
         self.corr_sum2[rows] += s2
         best = self.best_corr[rows]
@@ -317,10 +372,20 @@ class LeanBlockStats(BlockStats):
     fused = True
 
     def __init__(
-        self, *, n_sub: int, gemm_pixels: int, n_psi: int, device: torch.device
+        self,
+        *,
+        n_sub: int,
+        gemm_pixels: int,
+        n_psi: int,
+        device: torch.device,
+        n_virtual: int | None = None,
     ) -> None:
         super().__init__(
-            n_sub=n_sub, gemm_pixels=gemm_pixels, n_psi=n_psi, device=device
+            n_sub=n_sub,
+            gemm_pixels=gemm_pixels,
+            n_psi=n_psi,
+            device=device,
+            n_virtual=n_virtual,
         )
         sentinel = fused_kernel_loader.lean_sentinel_packed()
         if sentinel is None:
@@ -341,6 +406,9 @@ class LeanBlockStats(BlockStats):
             decode=False,
             hyp_offset=batch.virtual_offset,
             outs=[self.corr_sum[rows], self.corr_sum2[rows], self.best_packed[rows]],
+            # always the buffer (ones when unset; x * 1.0f is exact), so a captured
+            # graph reads whatever factors set_scale writes later
+            hyp_scale=self.hyp_scale,
         )
         if ran is None:
             raise RuntimeError(
@@ -380,4 +448,5 @@ def make_block_stats(spec: SpectrumSpec, *, fused: bool) -> BlockStats:
         gemm_pixels=spec.gemm_pixels,
         n_psi=spec.n_psi,
         device=spec.device,
+        n_virtual=spec.n_virtual,
     )
