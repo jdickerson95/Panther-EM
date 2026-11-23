@@ -331,6 +331,21 @@ class HypothesisSet:
 
     # -- decoding ------------------------------------------------------------
 
+    def select(self, values: torch.Tensor) -> torch.Tensor:
+        """``(D_sel, N_sel)`` entries of a ``(D, FF * O)`` per-hypothesis table."""
+        shape = (self.space.n_defocus, self.space.n_templates)
+
+        if tuple(values.shape) != shape:
+            raise ValueError(f"values must be {shape}, got {tuple(values.shape)}")
+
+        planes = torch.as_tensor(self.defocus_planes(), dtype=torch.long)
+        out = values[planes.to(values.device)]
+
+        if self.template_ids is not None:
+            out = out[:, self.template_ids.to(values.device)]
+
+        return out
+
     def template_rows(self, device: torch.device | str = "cpu") -> torch.Tensor:
         """``(N_sel,)`` rows of the ``FF * O`` weight matrix used by this plan."""
         if self.template_ids is None:

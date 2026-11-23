@@ -364,8 +364,9 @@ class SearchSession:
         The template, stages and shared resources.
     images : Micrograph or SearchImages
         One micrograph with its noise model (searched as its whitened image under its
-        CTF planes, at the positions its ``mask`` allows), or a plain stack for stages
-        without a threshold test.
+        CTF planes, at the positions its ``mask`` allows, every hypothesis scaled by its
+        ``hypothesis_scale`` when set), or a plain stack for stages without a threshold
+        test.
     thresholds : sequence of float or None, optional
         Per-stage decision thresholds for this image set (see
         :meth:`Searcher.with_thresholds`).
@@ -429,6 +430,14 @@ class SearchSession:
                     f"stage {i}: the micrograph's curves are on another frequency "
                     "axis than the threshold test's table"
                 )
+        scale = None if noise is None else noise.hypothesis_scale
+        if scale is not None:
+            expected = (searcher.space.n_defocus, searcher.space.n_templates)
+            if tuple(scale.shape) != expected:
+                raise ValueError(
+                    f"the micrograph's hypothesis_scale is {tuple(scale.shape)}; the "
+                    f"searcher's (plane, template) space is {expected}"
+                )
         self.searcher = searcher
         self.images = images
         self.noise = noise
@@ -457,6 +466,7 @@ class SearchSession:
             timeline=self.timeline,
             show_progress=exe.show_progress,
             local_bytes=exe.tuning.local_bytes,
+            hypothesis_scale=scale,
         )
         self._mark("session")
 

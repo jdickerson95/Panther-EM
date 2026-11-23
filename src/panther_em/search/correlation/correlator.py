@@ -120,6 +120,8 @@ class Correlator:
         self.device = torch.device(device)
         self.weights = weights
         self._prepared = _ByteLRU(prepared_budget)
+        # the last scaled moment forms: (key, the scale tensor they were built for)
+        self._scaled_forms: tuple[tuple, torch.Tensor, MomentForms] | None = None
         self.loops: dict[tuple, HypLoop] = {}
         self.forms: dict[tuple, MomentForms] = {}
         is_cuda = self.device.type == "cuda"
@@ -214,9 +216,15 @@ class Correlator:
         plan: LoopPlan,
         *,
         progress: Callable[[int], None] | None = None,
+        scale: torch.Tensor | None = None,
     ) -> StageMaps:
         """Reduce every block of ``store`` for ``plan``; ``progress(n_pixels_done)``."""
         hyps = plan.hyps
+        hyp_scale = (
+            None
+            if scale is None
+            else hyps.select(scale).reshape(-1).to(self.device, torch.float32)
+        )
         rows = hyps.template_rows(self.device) if not hyps.is_contiguous else None
         rows_key = hyps.template_signature if rows is not None else None
         prepared = {
@@ -233,6 +241,7 @@ class Correlator:
             for block in store.blocks(plan.groups):
                 if loop is None:
                     loop = self.loop_for(plan, prepared, block.operands)
+                    loop.stats.set_scale(hyp_scale)
                 loop.run(block.operands, block.n_valid)
                 start, n_valid = block.col_range[0], block.n_valid
                 loop.stats.finalize_into(targets, start, n_valid)
@@ -254,26 +263,43 @@ class Correlator:
 
     # -- local passes ------------------------------------------------------------
 
-    def moment_forms(self, plan: LoopPlan) -> MomentForms:
+    def moment_forms(
+        self, plan: LoopPlan, scale: torch.Tensor | None = None
+    ) -> MomentForms:
         """The closed-form moments of ``plan``'s template set (built once, cached)."""
         hyps = plan.hyps
-        key = (
+        key: tuple = (
             plan.layout.rectangles,
             plan.engine.precision,
             hyps.template_signature,
             plan.stage.n_psi,
         )
-        forms = self.forms.get(key)
-        if forms is None:
+        if scale is not None:
+            key = (*key, hyps.defocus_planes())
+            last = self._scaled_forms
+            if last is not None and last[0] == key and last[1] is scale:
+                return last[2]
             forms = MomentForms.build(
                 self.weights,
                 plan.layout,
                 plan.engine,
                 plan.stage.n_psi,
                 template_rows=None if hyps.is_contiguous else hyps.template_rows(),
+                plane_scale=hyps.select(scale),
             )
-            self.forms[key] = forms
-        return forms
+            self._scaled_forms = (key, scale, forms)
+            return forms
+        cached = self.forms.get(key)
+        if cached is None:
+            cached = MomentForms.build(
+                self.weights,
+                plan.layout,
+                plan.engine,
+                plan.stage.n_psi,
+                template_rows=None if hyps.is_contiguous else hyps.template_rows(),
+            )
+            self.forms[key] = cached
+        return cached
 
     @torch.no_grad()
     def run_local(
@@ -284,9 +310,10 @@ class Correlator:
         *,
         chunk_bytes: int,
         progress: Callable[[int], None] | None = None,
+        scale: torch.Tensor | None = None,
     ) -> StageMaps:
         """Score every column of ``store`` over its group's hypotheses only."""
-        forms = self.moment_forms(plan)
+        forms = self.moment_forms(plan, scale)
         maps = StageMaps.empty(store.n_pixels, self.device, plan.hyps.n_evaluated)
         with self._on_compute():
             correlate_local(
@@ -298,6 +325,7 @@ class Correlator:
                 chunk_bytes=chunk_bytes,
                 progress=progress,
                 out=maps,
+                scale=None if scale is None else plan.hyps.select(scale),
             )
         return maps
 
@@ -306,3 +334,4 @@ class Correlator:
         self.loops.clear()
         self._prepared.clear()
         self.forms.clear()
+        self._scaled_forms = None

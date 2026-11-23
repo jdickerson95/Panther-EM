@@ -17,6 +17,12 @@ real columns. The forms are built once per template set (:meth:`MomentForms.buil
 and cost one pass over a store (``num_k x inner^2`` multiply-adds per pixel and
 plane); they make the mean and variance of the *whole* set available without
 evaluating it, which is what lets a local stage score only a neighborhood.
+
+With a factor ``s_dn`` on every ``(plane, template)`` hypothesis (after-CTF noise
+normalization) the sums become ``sum_d v_d0 . u_d`` and ``sum_d sum_k v_dk^T Q_dk
+v_dk`` with ``u_d = sum_n s_dn a_n0`` and ``Q_dk = sum_n s_dn^2 (...)``: one form set
+per plane, built per image set, evaluated at the same cost (the sums already run
+per plane).
 """
 
 from __future__ import annotations
@@ -71,11 +77,14 @@ class RunForms:
     k_start : int
         First angular frequency of the run.
     q : torch.Tensor
-        ``(num_k, inner, inner)`` float32 symmetric forms with the bin weights folded
-        in: ``sum_n (Re C_n0)^2`` at ``k = 0``, ``sum_n (Re C_nk)^2`` at a Nyquist bin
-        and ``2 sum_n |C_nk|^2`` elsewhere.
+        ``(D_q, num_k, inner, inner)`` float32 symmetric forms with the bin weights
+        folded in: ``sum_n (Re C_n0)^2`` at ``k = 0``, ``sum_n (Re C_nk)^2`` at a
+        Nyquist bin and ``2 sum_n |C_nk|^2`` elsewhere. ``D_q = 1`` (shared by every
+        plane) or one per plane, with the hypotheses' factors ``s_dn^2`` inside the
+        sums.
     u : torch.Tensor or None
-        ``(inner,)`` float32 ``sum_n a_n0`` when the run holds ``k = 0``; else ``None``.
+        ``(D_q, inner)`` float32 ``sum_n s_dn a_n0`` when the run holds ``k = 0``;
+        else ``None``.
     """
 
     k_start: int
@@ -106,6 +115,11 @@ class MomentForms:
             raise ValueError("MomentForms needs at least one run")
 
     @property
+    def n_form_planes(self) -> int:
+        """``D_q``: 1 when every plane shares the forms, else one set per plane."""
+        return int(self.runs[0].q.shape[0])
+
+    @property
     def nbytes(self) -> int:
         """Bytes held by the forms."""
         return sum(
@@ -122,6 +136,7 @@ class MomentForms:
         n_psi: int,
         *,
         template_rows: torch.Tensor | None = None,
+        plane_scale: torch.Tensor | None = None,
         chunk: int = 4096,
     ) -> MomentForms:
         """Sum the forms over ``template_rows`` (``None`` = every row) of ``weights``.
@@ -139,6 +154,9 @@ class MomentForms:
             the Nyquist bin.
         template_rows : torch.Tensor, optional
             Template rows of the set.
+        plane_scale : torch.Tensor, optional
+            ``(D_sel, N_sel)`` factor ``s_dn`` of every (selected plane, selected
+            row) hypothesis: one form set per plane. ``None``: one shared set.
         chunk : int, optional
             Template rows per partial sum.
         """
@@ -148,13 +166,26 @@ class MomentForms:
             else template_rows.to(weights.device, torch.long)
         )
         n_sel = int(rows.numel())
+        scale = None
+        if plane_scale is not None:
+            if plane_scale.dim() != 2 or int(plane_scale.shape[1]) != n_sel:
+                raise ValueError(
+                    f"plane_scale must be (D_sel, {n_sel}), got "
+                    f"{tuple(plane_scale.shape)}"
+                )
+            scale = plane_scale.to(weights.device, torch.float32)
+        n_q = 1 if scale is None else int(scale.shape[0])
         nyquist = int(n_psi) // 2 if int(n_psi) % 2 == 0 else -1
         runs: list[RunForms] = []
         for run in layout.k_runs:
             inner = 2 * run.num_m
-            q_re = torch.zeros(run.num_k, inner, inner, device=weights.device)
+            q_re = torch.zeros(n_q, run.num_k, inner, inner, device=weights.device)
             q_im = torch.zeros_like(q_re)
-            u = torch.zeros(inner, device=weights.device) if run.k_start == 0 else None
+            u = (
+                torch.zeros(n_q, inner, device=weights.device)
+                if run.k_start == 0
+                else None
+            )
             for j0 in range(0, n_sel, int(chunk)):
                 sub = rows[j0 : j0 + int(chunk)]
                 # per part, as the operand concatenates each part's real row
@@ -176,15 +207,27 @@ class MomentForms:
                 ]
                 a = torch.cat([c[0] for c in columns], dim=-1)  # (num_k, n, inner)
                 b = torch.cat([c[1] for c in columns], dim=-1)
-                q_re += torch.bmm(a.transpose(1, 2), a)
-                q_im += torch.bmm(b.transpose(1, 2), b)
-                if u is not None:
-                    u += a[0].sum(dim=0)
+                if scale is None:
+                    q_re[0] += torch.bmm(a.transpose(1, 2), a)
+                    q_im[0] += torch.bmm(b.transpose(1, 2), b)
+                    if u is not None:
+                        u[0] += a[0].sum(dim=0)
+                    continue
+                s_sub = scale[:, j0 : j0 + int(sub.numel())]  # (D, n)
+                for d in range(n_q):
+                    s2 = s_sub[d].square()[None, :, None]
+                    q_re[d] += torch.bmm(a.transpose(1, 2), a * s2)
+                    q_im[d] += torch.bmm(b.transpose(1, 2), b * s2)
+                    if u is not None:
+                        u[d] += s_sub[d] @ a[0]
             k = torch.arange(run.k_start, run.k_stop, device=weights.device)
             real_only = (k == 0) | (k == nyquist)
             weight_re = torch.where(real_only, 1.0, 2.0)
             weight_im = torch.where(real_only, 0.0, 2.0)
-            q = weight_re[:, None, None] * q_re + weight_im[:, None, None] * q_im
+            q = (
+                weight_re[None, :, None, None] * q_re
+                + weight_im[None, :, None, None] * q_im
+            )
             runs.append(RunForms(run.k_start, q.contiguous(), u))
         return cls(runs, n_sel, n_psi)
 
@@ -196,22 +239,28 @@ class MomentForms:
         s1: torch.Tensor,
         s2: torch.Tensor,
         *,
+        plane: int = 0,
         chunk: int = 4096,
     ) -> None:
         """Add one plane's moment sums into ``s1`` / ``s2`` (``(P,)`` float32).
 
         ``operands[i]`` is the ``(num_k, P, inner)`` GEMM A operand of run ``i``
-        (parts already concatenated along ``inner``), as the hypothesis loop feeds it.
+        (parts already concatenated along ``inner``), as the hypothesis loop feeds it;
+        ``plane`` the selected plane's position (selects its forms when they are per
+        plane).
         """
+        d = int(plane) if self.n_form_planes > 1 else 0
         for forms, a in zip(self.runs, operands, strict=True):
+            q = forms.q[d]
+            u = None if forms.u is None else forms.u[d]
             n_pixels = int(a.shape[1])
             for p0 in range(0, n_pixels, int(chunk)):
                 p1 = min(p0 + int(chunk), n_pixels)
                 v = real_operand(a[:, p0:p1], engine)  # (K, Pc, inner)
-                quad = (torch.bmm(v, forms.q) * v).sum(dim=(0, 2))  # (Pc,)
+                quad = (torch.bmm(v, q) * v).sum(dim=(0, 2))  # (Pc,)
                 s2[p0:p1] += self.n_psi * quad
-                if forms.u is not None:
-                    s1[p0:p1] += self.n_psi * (v[0] @ forms.u)
+                if u is not None:
+                    s1[p0:p1] += self.n_psi * (v[0] @ u)
 
 
 @torch.no_grad()
@@ -230,7 +279,13 @@ def block_moments(
     device = next(iter(operands.values())).device
     s1 = torch.zeros(n_valid, dtype=torch.float32, device=device)
     s2 = torch.zeros_like(s1)
-    for d_local in range(plan.hyps.n_defocus_selected):
+    n_planes = plan.hyps.n_defocus_selected
+    if forms.n_form_planes not in (1, n_planes):
+        raise ValueError(
+            f"forms hold {forms.n_form_planes} plane sets for a pass of "
+            f"{n_planes} planes"
+        )
+    for d_local in range(n_planes):
         per_run = []
         for run in plan.layout.k_runs:
             parts = []
@@ -248,7 +303,7 @@ def block_moments(
                     )
                 )
             per_run.append(parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1))
-        forms.accumulate(per_run, engine, s1, s2)
+        forms.accumulate(per_run, engine, s1, s2, plane=d_local)
     return s1, s2
 
 

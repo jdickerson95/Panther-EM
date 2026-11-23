@@ -135,6 +135,7 @@ def correlate_local(
     chunk_bytes: int,
     progress: Callable[[int], None] | None = None,
     out: StageMaps | None = None,
+    scale: torch.Tensor | None = None,
 ) -> StageMaps:
     """Score every store column over its group's hypotheses (see the module notes).
 
@@ -156,6 +157,9 @@ def correlate_local(
         ``progress(n_columns_done)``.
     out : StageMaps, optional
         Maps to fill in place (allocated by the caller, on its stream).
+    scale : torch.Tensor, optional
+        ``(D_sel, N_sel)`` factor of every (selected plane, selected row) hypothesis;
+        ``forms`` must have been built with the same factors.
     """
     hyps = plan.hyps
     device = store.device
@@ -192,6 +196,14 @@ def correlate_local(
     columns, valid, tile_cell = make_tiles(work.cells, tile)
     template_rows = hyps.template_rows(device)[work.rows.to(device)]  # (G, W)
     group_rows = work.rows.to(device)
+    if scale is not None:
+        if tuple(scale.shape) != (n_planes, n_sel):
+            raise ValueError(
+                f"scale must be ({n_planes}, {n_sel}), got {tuple(scale.shape)}"
+            )
+        if forms.n_form_planes != n_planes:
+            raise ValueError("scaled hypotheses need per-plane moment forms")
+        scale = scale.to(device, torch.float32)
     per_tile = (
         8 * tile * n_planes * width * (3 * n_freq + n_psi)
         + 16 * (tile * n_planes + width) * cells_total
@@ -252,6 +264,9 @@ def correlate_local(
                 nt, run.num_k, n_planes, tile, width
             ).permute(0, 3, 2, 4, 1)
 
+        if scale is not None:
+            factor = scale[:, group_rows[cell]].permute(1, 0, 2)  # (nt, D, W)
+            spectrum *= factor[:, None, :, :, None]
         vmax, amax = max_spectrum(
             spectrum.reshape(nt * tile, n_planes * width, n_freq), n_psi
         )

@@ -107,6 +107,9 @@ class StageRunner:
         Print a progress bar per stage.
     local_bytes : int, optional
         Working-memory budget of one chunk of a local stage's tiles.
+    hypothesis_scale : torch.Tensor, optional
+        ``(D, FF * O)`` factor of every ``(plane, template)`` hypothesis (after-CTF
+        noise normalization), handed to every correlation.
 
     Attributes
     ----------
@@ -126,6 +129,7 @@ class StageRunner:
         timeline: Timeline | None = None,
         show_progress: bool = False,
         local_bytes: int = 512 * 1024**2,
+        hypothesis_scale: torch.Tensor | None = None,
     ) -> None:
         self.images = images
         self.geometry = geometry
@@ -135,6 +139,7 @@ class StageRunner:
         self.timeline = timeline or Timeline(device)
         self.show_progress = show_progress
         self.local_bytes = int(local_bytes)
+        self.hypothesis_scale = hypothesis_scale
         self.store: FeatureStore | None = None
 
     def release(self) -> None:
@@ -177,7 +182,9 @@ class StageRunner:
         loop_plan = LoopPlan.create(plan.stage, store, step.memory)
         self.timeline.mark(f"stage{plan.index}:planned")
         if plan.local is None:
-            maps = self.correlator.run(store, loop_plan, progress=progress)
+            maps = self.correlator.run(
+                store, loop_plan, progress=progress, scale=self.hypothesis_scale
+            )
         else:
             assert band.cells is not None
             maps = self.correlator.run_local(
@@ -186,6 +193,7 @@ class StageRunner:
                 LocalWork(band.cells, plan.local.rows),
                 chunk_bytes=self.local_bytes,
                 progress=progress,
+                scale=self.hypothesis_scale,
             )
         self._synchronize()
         t2 = time.perf_counter()
