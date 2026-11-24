@@ -185,6 +185,18 @@ class ThresholdTest:
         q_cross = noise @ t["reconstruction_residual_corr"]
         lam = torch.where(q_kept > 0, q_cross / q_kept.clamp_min(1e-300), 0.0)
         q_perp = (q_residual - lam**2 * q_kept).clamp_min(0.0)
+        scale = images.hypothesis_scale
+        if scale is not None:
+            # a hypothesis's whole correlation (kept and missed) is scaled by s_dn:
+            # its noise variances by s_dn^2; lam and rho are ratios
+            if tuple(scale.shape) != tuple(q_kept.shape):
+                raise ValueError(
+                    f"the micrograph's hypothesis_scale is {tuple(scale.shape)}; the "
+                    f"table's (plane, row) grid is {tuple(q_kept.shape)}"
+                )
+            s2 = scale.to(torch.float64).square()
+            q_kept = q_kept * s2
+            q_perp = q_perp * s2
         g_kept = weight @ t["signal_reconstruction_corr"]
         g_residual = weight @ t["signal_residual_corr"]
         total = g_kept + g_residual

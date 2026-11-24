@@ -111,6 +111,7 @@ def lean_irfft_stats_transposed(
     decode: Literal[True] = True,
     hyp_offset: int = 0,
     outs: list[torch.Tensor] | None = None,
+    hyp_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 @overload
 def lean_irfft_stats_transposed(
@@ -119,6 +120,7 @@ def lean_irfft_stats_transposed(
     decode: Literal[False],
     hyp_offset: int = 0,
     outs: list[torch.Tensor] | None = None,
+    hyp_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None: ...
 def lean_irfft_stats_transposed(
     c: torch.Tensor,
@@ -126,6 +128,7 @@ def lean_irfft_stats_transposed(
     decode: bool = True,
     hyp_offset: int = 0,
     outs: list[torch.Tensor] | None = None,
+    hyp_scale: torch.Tensor | None = None,
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -157,6 +160,10 @@ def lean_irfft_stats_transposed(
         returning fresh outputs. ``best_packed`` must start at
         :func:`lean_sentinel_packed`. With this the whole hypothesis loop needs no
         per-batch accumulate kernels at all.
+    hyp_scale : torch.Tensor, optional
+        Contiguous 1-D float32 factor of every hypothesis, indexed by its global id
+        (``hyp_offset + q``): hypothesis ``q``'s correlogram is multiplied by
+        ``hyp_scale[hyp_offset + q]`` (> 0) before the maximum and the moments.
 
     Returns
     -------
@@ -174,7 +181,11 @@ def lean_irfft_stats_transposed(
         return None
     try:
         s1, s2, argmax_packed = module.lean_irfft_stats_transposed(
-            c, int(n_psi), int(hyp_offset), list(outs) if outs is not None else []
+            c,
+            int(n_psi),
+            int(hyp_offset),
+            list(outs) if outs is not None else [],
+            hyp_scale,
         )
     except Exception as exc:
         if not _warned_runtime_failure:

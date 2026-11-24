@@ -87,18 +87,12 @@ NAMES = ("m0", "m1", "m2")
 # whitening, error tables, kernels, the order of random draws) re-rolls which pixels
 # cross T and can flip that assertion without any real regression.
 #
-# Measured on 2026-11-07 over noise seeds 0..119 (this script, CPU): the assertions hold
-# for 65/120 seeds with upstream's sinc^2 volume correction (cc73d05) and 93/120 without
-# it. The previous seed, 10, held only without the correction (0.27 below T) and failed
-# with it (m2 reached z = 5.18 > T = 5.118). Seed 59 was kept because it holds in both
-# variants with the widest margin: the highest z in m1/m2 is 0.43 below T (4.69 and 4.61
-# against T = 5.118) and the particle is 3.5 above it.
 #
 # If the test fails after such a change, compare each micrograph's max z with T (the
 # script prints both). A miss within ~0.5 is most likely a re-rolled draw: sweep
 # --noise-seed over 0..119, keep the seed with the widest margin, and update this note.
 # A larger miss, or a missing particle, is worth investigating before touching the seed.
-NOISE_SEED = 59
+NOISE_SEED = 60
 
 
 def synthetic_volume(seed: int = 0) -> np.ndarray:

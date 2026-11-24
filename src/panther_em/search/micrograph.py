@@ -9,6 +9,9 @@
   the band (mean 1).
 - ``mask (H, W)``: optional, the pixels a particle center may lie on; only those
   are searched.
+- ``hypothesis_scale (D, N)``: optional, the factor every ``(plane, template row)``
+  hypothesis's correlation is multiplied by (after-CTF noise normalization,
+  :mod:`panther_em.search.normalization`).
 """
 
 from __future__ import annotations
@@ -89,6 +92,12 @@ class Micrograph:
         is the box centered on image pixel ``(r + kH // 2, c + kW // 2)``). THe other
         positions are labeled ``MASKED``. ``None`` (default) searches every position.
         A mask over search positions instead of image pixels may be supported later.
+    hypothesis_scale : torch.Tensor, optional
+        ``(D, N)`` float64 CPU factor (finite, positive) of every ``(plane, template
+        row)`` hypothesis: the search multiplies that hypothesis's correlation by it
+        and the threshold test its noise variances by its square. Set by
+        :func:`panther_em.search.normalization.normalize`; ``None`` (default) leaves
+        every hypothesis unscaled.
     """
 
     name: str
@@ -100,6 +109,7 @@ class Micrograph:
     level: torch.Tensor
     pixel_size: float
     mask: torch.Tensor | None = None
+    hypothesis_scale: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Validate (never coerce); see :meth:`prepare`."""
@@ -161,6 +171,20 @@ class Micrograph:
             or m.device.type != "cpu"
         ):
             raise ValueError(f"mask must be a bool CPU {(h, w)} tensor")
+
+        hs = self.hypothesis_scale
+        if hs is not None:
+            if (
+                hs.dim() != 2
+                or int(hs.shape[0]) != n_planes
+                or hs.dtype is not torch.float64
+                or hs.device.type != "cpu"
+            ):
+                raise ValueError(
+                    f"hypothesis_scale must be a float64 CPU ({n_planes}, N) tensor"
+                )
+            if not bool(torch.isfinite(hs).all()) or bool((hs <= 0).any()):
+                raise ValueError("hypothesis_scale must be finite and positive")
 
     @classmethod
     def prepare(
@@ -301,6 +325,8 @@ class Micrograph:
                 f[field] = getattr(self, field).cpu().numpy()
             if self.mask is not None:
                 create_dataset(f, "mask", self.mask.numpy())
+            if self.hypothesis_scale is not None:
+                create_dataset(f, "hypothesis_scale", self.hypothesis_scale.numpy())
 
     @classmethod
     def load(cls, path: str | Path, device: torch.device | str = "cpu") -> Micrograph:
@@ -322,6 +348,9 @@ class Micrograph:
                 level=read("level"),
                 pixel_size=float(f.attrs["pixel_size"]),
                 mask=read("mask") if "mask" in f else None,
+                hypothesis_scale=(
+                    read("hypothesis_scale") if "hypothesis_scale" in f else None
+                ),
             )
         return micrograph.to(device)
 

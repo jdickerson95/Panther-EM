@@ -56,6 +56,7 @@ from panther_em.search import (
 )
 from panther_em.search.correlation.contraction import BatchShape
 from panther_em.search.images import SearchGeometry
+from panther_em.search.normalization import normalize
 
 
 class Optics(Model):
@@ -169,6 +170,12 @@ class SearchConfig(ProgramConfig):
         when its search starts.
     device : str
         Compute device. Default ``"cpu"``.
+    normalization : {"after_ctf", "before_ctf"}
+        When to apply normalization per hypothesis. ``"after_ctf"`` (default) normalizes
+        each ``(plane, template)`` hypothesis to the same noise variance under its CTF
+        plane which matches 2DTM theory mathematically. ``"before_ctf"``: Panther-EM's
+        original behavior, every template projection at unit variance before the CTF,
+        which is incorrect due to spatial-frequency dependent noise variance.
     """
 
     program: ClassVar[str] = "search"
@@ -191,6 +198,7 @@ class SearchConfig(ProgramConfig):
     pending_writes: int = Field(default=1, ge=0)
     prefetch: int = Field(default=0, ge=0)
     device: str = "cpu"
+    normalization: Literal["after_ctf", "before_ctf"] = "after_ctf"
 
     @model_validator(mode="after")
     def _links(self) -> SearchConfig:
@@ -281,6 +289,26 @@ class _Run:
         self.execution = execution_config(config.execution)
         self.offsets = torch.tensor(config.defocus_offsets, dtype=torch.float32)
         self.searchers: dict[tuple[int, int], Searcher] = {}
+        self.normalization_reports: dict[str, dict] = {}
+        # the table whose kept correlation after-CTF normalization equalizes
+        self.normalization_table: PerSpatialFrequencyErrorTable | None = None
+        if config.normalization == "after_ctf":
+            self.normalization_table = self._normalization_table()
+
+    def _final_table_tag(self) -> str:
+        """The table of the last stage that has one (the reported z-scores' stage)."""
+        for spec in reversed(self.config.stages):
+            if spec.table is not None:
+                return spec.table
+        return self.config.noise_tag
+
+    def _normalization_table(self) -> PerSpatialFrequencyErrorTable:
+        """The final stage's table, or the noise table when its axis differs."""
+        table = self.tables[self._final_table_tag()]
+        noise_table = self.tables[self.config.noise_tag]
+        if not torch.equal(table.frequencies, noise_table.frequencies):
+            return noise_table
+        return table
 
     def threshold(self, spec: StageSpec, n_pixels: int) -> float:
         """The stage's threshold for a micrograph of ``n_pixels`` searched positions."""
@@ -364,6 +392,16 @@ class _Run:
 
     def prepare(self, loaded: _Loaded) -> Micrograph:
         """The searched micrograph of a :func:`_read` (device work and the cache)."""
+        micrograph = self._prepare_unscaled(loaded)
+
+        if self.normalization_table is not None:
+            micrograph, report = normalize(micrograph, self.normalization_table)
+            self.normalization_reports[loaded.entry.key] = report
+
+        return micrograph
+
+    def _prepare_unscaled(self, loaded: _Loaded) -> Micrograph:
+        """The micrograph without hypothesis factors (cached when allowed)."""
         config, entry = self.config, loaded.entry
 
         if isinstance(loaded.data, Micrograph):
@@ -501,6 +539,8 @@ def run(config: SearchConfig) -> dict[str, Path]:
     def finish(write: Future[tuple[str, Path, dict]]) -> None:
         name, path, record = write.result()
         done[name] = path
+        if state is not None and name in state.normalization_reports:
+            record["normalization"] = state.normalization_reports[name]
         summary[name] = record
         summary_path.write_text(json.dumps(summary, indent=1))
 
