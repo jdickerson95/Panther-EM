@@ -329,6 +329,37 @@ def test_masked_search(pipeline, tmp_path):
     assert (int(pos_y[0]), int(pos_x[0])) == module.PARTICLE["top_left"]
 
 
+def test_threshold_floor(pipeline):
+    """``threshold: {floor: c}`` sets a stage's threshold to ``c / zeta`` (``c``
+    without a test); a stage that keeps every pixel only above the final threshold
+    warns."""
+    module, out = pipeline
+    data = yaml.safe_load((out / "search.yaml").read_text())
+    data["stages"][0]["decision"]["threshold"] = {"floor": 2.5}
+    data["stages"][1]["decision"]["threshold"] = 2.5
+    config = SearchConfig.model_validate(data)
+    decision = config.stages[0].decision
+    assert decision.threshold == search.ThresholdFloor(floor=2.5)
+    # result files record the config as JSON
+    assert SearchConfig.model_validate(config.model_dump(mode="json")) == config
+    shape = (module.MICROGRAPH, module.MICROGRAPH)
+    state = search._Run(config)
+    stages = state.searcher(shape).stages  # (no warning: pytest makes them errors)
+    assert stages[0].decision.threshold == pytest.approx(2.5 / decision.zeta)
+    assert decision.floor(stages[0].decision.threshold) == pytest.approx(2.5)
+    assert stages[1].decision.threshold == 2.5
+    state.release()
+    plain = decision.model_copy(update={"calibration": None})
+    assert plain.zeta == 1.0 and plain.floor(2.5) == 2.5
+    # the production gate before a lowered final threshold
+    data["stages"][0]["decision"]["threshold"] = "auto"
+    lowered = search._Run(SearchConfig.model_validate(data))
+    match = r"stage 0 \(coarse\) keeps every pixel only above z .*\{floor: 2\.500\}"
+    with pytest.warns(UserWarning, match=match):
+        lowered.searcher(shape)
+    lowered.release()
+
+
 def test_masked_search_mask_overrides_the_cache(pipeline, tmp_path):
     """The entry's mask replaces a cached micrograph's, or drops it."""
     config, image_mask = masked_search(pipeline, tmp_path)

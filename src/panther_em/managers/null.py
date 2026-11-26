@@ -36,9 +36,12 @@ Outputs in ``output_dir``:
 The gate. A multi-stage search drops pixels a stage's threshold test predicts cannot
 reach the threshold; below a floor the final z-score map, and so the null count, can
 be incomplete. The floor is recorded (``gate``) and every threshold is flagged
-``complete`` when it lies at or above it. Seeds: micrograph ``i`` of the search config
-uses ``seed + i * seed_stride`` for each listed ``seed``, so different micrographs get
-different copies.
+``complete`` when it lies at or above it; with ``refine``, every cut is flagged
+``candidates_complete`` when the floor lies at or below the candidate threshold (set the
+gating stage's ``threshold: {floor: c}``, :class:`~.search.ThresholdFloor`).
+
+Seeds: micrograph ``i`` of the search config uses ``seed + i * seed_stride`` for each
+listed ``seed``, so different micrographs get different copies.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -405,8 +409,8 @@ def gate_floor(config: SearchConfig, thresholds: list[float]) -> dict[str, Any]:
     stages: list[dict[str, Any]] = []
     for spec, threshold in zip(config.stages[:-1], thresholds[:-1], strict=True):
         calibration = spec.decision.calibration
-        zeta = 1.0 if calibration is None else calibration.zeta
-        floor = float(threshold) * zeta
+        zeta = spec.decision.zeta
+        floor = spec.decision.floor(threshold)
         stages.append(
             {
                 "name": spec.name,
@@ -418,6 +422,16 @@ def gate_floor(config: SearchConfig, thresholds: list[float]) -> dict[str, Any]:
         )
     floors = [s["floor"] for s in stages if s["floor"] is not None]
     return {"stages": stages, "floor": max(floors) if floors else None}
+
+
+def candidates_complete(gate: float | None, refine: RefineSpec) -> bool:
+    """Whether the gate keeps every candidate refined (floor <= candidate threshold).
+
+    Otherwise the search drops pixels whose final z-score would have reached the
+    candidate threshold; set the gating stage's ``threshold: {floor: c}``
+    (:class:`~.search.ThresholdFloor`) with ``c`` the candidate threshold.
+    """
+    return gate is None or refine.candidate_threshold >= gate - 1e-6
 
 
 def _thresholds_of(state: _Run, micrograph: Micrograph) -> list[float]:
@@ -463,8 +477,10 @@ def _cuts(
             predicted = prediction.zscore_cutoff(fp)
             cut["analytic"] = predicted if math.isfinite(predicted) else None
         if refined is not None:
+            assert config.refine is not None
             value = refined.zscore_cutoff(fp)
             cut["analytic_refined"] = value if math.isfinite(value) else None
+            cut["candidates_complete"] = candidates_complete(gate, config.refine)
         out.append(cut)
     return out
 
@@ -734,6 +750,17 @@ def run(config: NullConfig) -> dict[str, Any]:
                 continue
             thresholds = _thresholds_of(state, source)
             gate = gate_floor(search_config, thresholds)
+            if config.refine is not None and not candidates_complete(
+                gate["floor"], config.refine
+            ):
+                warnings.warn(
+                    f"{name}: the search keeps every pixel only above z "
+                    f"{gate['floor']:.3f}, above the candidate threshold "
+                    f"{config.refine.candidate_threshold}; the refined null models "
+                    "candidates the search can drop (set the gating stage's "
+                    "threshold to {floor: candidate_threshold})",
+                    stacklevel=2,
+                )
             floor = (
                 thresholds[-1] - DEFAULT_FLOOR_OFFSET
                 if config.peak_floor is None

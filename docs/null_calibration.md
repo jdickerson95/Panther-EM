@@ -69,7 +69,8 @@ threshold test predicts cannot reach `zeta * T`; below that the final map, and s
 count, can be incomplete. The summary records this floor (`gate.floor`: 7.704 for the
 production config, `0.98 x 7.861`) and flags every threshold `complete: true / false`
 against it. A cut below the floor is biased low; check it with a copy searched without the
-gate (stage 1 `threshold: -1e9, accept: false, calibration: null`).
+gate (stage 1 `threshold: -1e9, accept: false, calibration: null`), or set the floor where
+the cuts are used (`threshold: {floor: c}`, see [the refine route](#the-gate-on-the-refine-route)).
 
 **Analytic null** (`mode: analytic`, or `both`; `panther_em.search.null_model`). The
 correlation of a phase-randomised image with the templates is a Gaussian random field whose
@@ -184,6 +185,44 @@ nulls; refined z recomputed for the per-stage scale from the stored refine outpu
   cost.
 * **Cost:** ~45 s per sampled candidate at ±1 px on one GPU (7,900 scores per window).
 
+#### The gate on the refine route
+
+Candidates at the candidate threshold `c` are complete only when every stage before the
+final one keeps every pixel whose final z can reach `c`: its floor, `zeta * T`, must be at
+or below `c`. The production gate (`threshold: auto`, one expected false positive) is set
+for calls at the 1-false-positive threshold. Its floor (`zeta` times the auto threshold, the
+summary's `gate.floor`) lies above a candidate threshold such as 6.8, so the search drops
+pixels in exactly the range the candidates come from. Set the gating stage's threshold by
+its floor instead, and accept at `c` in the final stage:
+
+```yaml
+stages:
+  - name: coarse
+    # ...
+    decision:
+      threshold: {floor: 6.8}   # T = 6.8 / zeta: keeps every pixel that can reach 6.8
+      calibration: {alpha: 0.02, zeta: 0.98, eps_rho: 0.1, b_factor: 10.0}
+      accept: false
+  - name: fine
+    # ...
+    decision:
+      threshold: 6.8            # the candidates exported for refinement
+      calibration: {alpha: 0.05, zeta: 0.99, eps_rho: 0.1, b_factor: 30.0}
+```
+
+`{floor: c}` sets `T = c / zeta` (`T = c` for a stage without a threshold test). `search`
+warns when a stage's floor lies above the final stage's threshold. With a `refine` block,
+`null` warns when the gate's floor lies above `candidate_threshold`, and flags each cut
+`candidates_complete: true / false`.
+
+A floor this low sends many more pixels to stage 2 (5-100 % of the image, not a few per
+cent), so stage 2's FFT featurization works on large regions; #26 sizes its chunks to the
+free device memory (before it, the default settings could run out of it). Measured on the
+large ribosomal subunit (LSU) of yeast ribosomes in situ at 300 kV: a floor at 6.8, with
+stage 1's rectangle sized by an error target of 0.31 (`calibrate`, #24), kept every peak
+above the 1- and 5-false-positive cuts of a complete (ungated) search, in a third of its
+time.
+
 ## 4. Cost
 
 * **Measured:** one full search per copy, plus a few seconds of peak finding: 5 to 6 min
@@ -296,11 +335,11 @@ copies, predicted and measured 1- and 3-false-positive cuts agree within 0.15 z.
 
 | file | change |
 |---|---|
-| `src/panther_em/managers/null.py` | new: `NullConfig`, `run`; copies, peaks file, summary, gate floor |
+| `src/panther_em/managers/null.py` | new: `NullConfig`, `run`; copies, peaks file, summary, gate floor, `candidates_complete` |
 | `src/panther_em/search/null_model.py` | new: `predict_null`, `predict_refined_null`, `TemplateProjector`, `SearchTemplates`, `lag_grid_planes`, `lattice_neighbours`, `reference_grid`, `healpix_nside` |
 | `src/panther_em/managers/leopard.py` | `correlation_scales`: the export's scale per stage |
 | `src/panther_em/managers/_common.py` | `read_image`, `centered` (split out of `read_micrograph`, unchanged behaviour) |
-| `src/panther_em/managers/search.py` | `_Run.reference_noise`: the after-CTF reference noise kept for the predictor |
+| `src/panther_em/managers/search.py` | `_Run.reference_noise`: the after-CTF reference noise kept for the predictor; `ThresholdFloor` (`threshold: {floor: c}`) and the warning of `warn_incomplete_gate` |
 | `src/panther_em/cli.py`, `managers/__init__.py` | the `null` program |
 | `scripts/threshold_test_pipeline.py` | step 7: nulls of the empty micrograph m1 |
 | `tests/test_null.py`, `tests/test_managers.py` | new tests; `null` in the config round trip and CLI tests |

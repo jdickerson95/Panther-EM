@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -99,19 +100,45 @@ class CalibrationSpec(Model):
     b_factor: float = 0.0
 
 
+class ThresholdFloor(Model):
+    """A stage's threshold set by its completeness floor: ``threshold: {floor: c}``.
+
+    A stage's threshold test discards the pixels whose final z-score it predicts
+    below ``zeta * T`` (``T`` the threshold), so the stage keeps every pixel above
+    that floor (to the test's confidence); without a test it rejects below ``T``.
+    ``{floor: c}`` sets ``T = c / zeta`` (``T = c`` without a test), which puts the
+    floor at ``c``. A stage before the final one needs its floor at or below the z
+    the final scores are used at: the candidate threshold when candidates are
+    exported for Leopard-EM refinement, where the production gate (``auto``, set for
+    calls at the one-false-positive threshold) leaves them incomplete.
+    """
+
+    floor: float
+
+
 class DecisionSpec(Model):
     """A stage's :class:`~panther_em.search.Decision`.
 
     ``threshold="auto"`` is :func:`~panther_em.search.zscore_threshold` of the
     micrograph's searched positions (those its mask leaves) and the stage's
-    hypotheses (one expected false detection per micrograph). ``calibration`` adds
-    the threshold test on the stage's table.
+    hypotheses (one expected false detection per micrograph); ``{floor: c}`` sets it
+    from the stage's completeness floor (:class:`ThresholdFloor`). ``calibration``
+    adds the threshold test on the stage's table.
     """
 
-    threshold: float | Literal["auto"] = "auto"
+    threshold: float | Literal["auto"] | ThresholdFloor = "auto"
     calibration: CalibrationSpec | None = None
     accept: bool = True
     absorb_radius: int = Field(default=0, ge=0)
+
+    @property
+    def zeta(self) -> float:
+        """The test's threshold-lowering factor (1 without a test)."""
+        return 1.0 if self.calibration is None else self.calibration.zeta
+
+    def floor(self, threshold: float) -> float:
+        """``zeta * threshold``: the z above which the stage keeps every pixel."""
+        return self.zeta * float(threshold)
 
 
 class StageSpec(Model):
@@ -252,6 +279,29 @@ def execution_config(spec: dict[str, Any]) -> ExecutionConfig:
     return ExecutionConfig(**fields, tuning=Tuning(**tuning))
 
 
+def warn_incomplete_gate(stages: list[StageSpec], thresholds: list[float]) -> None:
+    """Warn when a stage's floor lies above the accepting final stage's threshold.
+
+    Pixels whose final z-score lies between the two can be dropped before the final
+    stage scores them (see :class:`ThresholdFloor`).
+    """
+    if len(stages) < 2 or not stages[-1].decision.accept:
+        return
+    final = float(thresholds[-1])
+    for i, (spec, threshold) in enumerate(
+        zip(stages[:-1], thresholds[:-1], strict=True)
+    ):
+        floor = spec.decision.floor(threshold)
+        if floor > final + 1e-6:
+            warnings.warn(
+                f"stage {i} ({spec.name or 'unnamed'}) keeps every pixel only above "
+                f"z {floor:.3f}, above the final threshold {final:.3f}: detections "
+                f"between the two can be lost; set its threshold to {{floor: "
+                f"{final:.3f}}} or lower",
+                stacklevel=3,
+            )
+
+
 @dataclass(frozen=True)
 class _Loaded:
     """A micrograph's host data: its cached :class:`Micrograph` (CPU) or raw image."""
@@ -357,8 +407,11 @@ class _Run:
 
     def threshold(self, spec: StageSpec, n_pixels: int) -> float:
         """The stage's threshold for a micrograph of ``n_pixels`` searched positions."""
-        if spec.decision.threshold != "auto":
-            return float(spec.decision.threshold)
+        threshold = spec.decision.threshold
+        if isinstance(threshold, ThresholdFloor):
+            return threshold.floor / spec.decision.zeta
+        if threshold != "auto":
+            return float(threshold)
         space = self.template.space
         n_hypotheses = (
             len(self.config.defocus_offsets)
@@ -399,8 +452,13 @@ class _Run:
     def searcher(self, shape: tuple[int, int]) -> Searcher:
         """The searcher of micrographs of ``shape`` (thresholds depend on it)."""
         if shape not in self.searchers:
+            thresholds = [
+                self.threshold(spec, self.n_positions(shape))
+                for spec in self.config.stages
+            ]
+            warn_incomplete_gate(self.config.stages, thresholds)
             stages = []
-            for spec in self.config.stages:
+            for spec, threshold in zip(self.config.stages, thresholds, strict=True):
                 d = spec.decision
                 test = None
                 if d.calibration is not None and spec.table is not None:
@@ -417,7 +475,7 @@ class _Run:
                         planes=spec.planes,
                         local_rings=spec.local_rings,
                         decision=Decision(
-                            self.threshold(spec, self.n_positions(shape)),
+                            threshold,
                             test,
                             accept=d.accept,
                             absorb_radius=d.absorb_radius,

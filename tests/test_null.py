@@ -240,7 +240,12 @@ def test_predicted_refined_null(pipeline, tmp_path):
     """With a refine_template config, the analytic mode also predicts the threshold
     on refined z-scores, from the search's own templates and refinement's exact ones."""
     _, out = pipeline
-    path = low_defocus(out, tmp_path / "low.yaml")
+    # the refine route's gate: complete above the candidate threshold, which the
+    # final stage accepts at
+    stages = yaml.safe_load((out / "search.yaml").read_text())["stages"]
+    stages[0]["decision"]["threshold"] = {"floor": 3.0}
+    stages[1]["decision"]["threshold"] = 3.0
+    path = low_defocus(out, tmp_path / "low.yaml", stages=stages)
     refine = tmp_path / "refine.yaml"
     refine.write_text(
         yaml.safe_dump(
@@ -278,6 +283,8 @@ def test_predicted_refined_null(pipeline, tmp_path):
     )
     record = summary["micrographs"]["m1"]
     cut = record["cuts"][0]
+    assert record["gate"]["floor"] == pytest.approx(3.0)
+    assert cut["candidates_complete"]
     # Leopard-EM re-scores exactly what the search approximated: the refined cut may
     # fall below the search's (here it does, on a coarse decomposition)
     assert np.isfinite(cut["analytic_refined"]) and np.isfinite(cut["analytic"])
@@ -390,6 +397,38 @@ def test_null_program(pipeline, tmp_path, monkeypatch):
         null.run(more.model_copy(update={"micrographs": ["nope"]}))
     with h5py.File(config.peaks_path, "r") as f:
         assert sorted(f["m2"]) == ["s2004", "s2005", "s2006"]
+
+
+def test_candidates_complete_needs_the_gate_at_the_candidate_threshold(pipeline):
+    """The production gate (``auto``) keeps every pixel only above ``zeta * T``; the
+    refine route's candidates below it are not complete until the gating stage's
+    threshold is set by its floor."""
+    _, out = pipeline
+    config = search.SearchConfig.from_yaml(out / "search.yaml")
+    refine = null.RefineSpec(config=out / "refine.yaml", candidate_threshold=6.8)
+    zeta = config.stages[0].decision.zeta
+    auto = null.gate_floor(config, [8.0, 8.0])
+    assert auto["floor"] == pytest.approx(zeta * 8.0)
+    assert not null.candidates_complete(auto["floor"], refine)
+    assert null.candidates_complete(None, refine)  # one stage: no gate
+    stages = [
+        config.stages[0].model_copy(
+            update={
+                "decision": config.stages[0].decision.model_copy(
+                    update={"threshold": search.ThresholdFloor(floor=6.8)}
+                )
+            }
+        ),
+        config.stages[1],
+    ]
+    gated = config.model_copy(update={"stages": stages})
+    state = search._Run(gated)
+    thresholds = [state.threshold(spec, 10_000) for spec in gated.stages]
+    state.release()
+    assert thresholds[0] == pytest.approx(6.8 / zeta)
+    floor = null.gate_floor(gated, thresholds)["floor"]
+    assert floor == pytest.approx(6.8)
+    assert null.candidates_complete(floor, refine)
 
 
 def test_null_config_validation(tmp_path):
